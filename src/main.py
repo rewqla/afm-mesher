@@ -1,3 +1,4 @@
+import argparse
 import sys
 import csv
 import json
@@ -8,18 +9,20 @@ from pathlib import Path
 if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.application.services.advancing_front_mesher import AdvancingFrontMesher
-from src.domain.geometry.geometry_utils import mesh_average_quality, mesh_quality_report
-from src.infrastructure.export.mesh_exporter import (
-    export_mesh_obj,
-    export_mesh_ply,
-    export_mesh_vtk,
-)
-from src.infrastructure.image.photo_preprocessor import preprocess_photo_to_boundary
-from src.infrastructure.visualization.debug_visualizer import save_debug_visualization
+# DEFAULT_RUN_MODE = "batch" 
+DEFAULT_RUN_MODE = "ui"
 
+def run_batch_mode() -> None:
+    from src.application.services.advancing_front_mesher import AdvancingFrontMesher
+    from src.domain.geometry.geometry_utils import mesh_quality_report
+    from src.infrastructure.export.mesh_exporter import (
+        export_mesh_obj,
+        export_mesh_ply,
+        export_mesh_vtk,
+    )
+    from src.infrastructure.image.photo_preprocessor import preprocess_photo_to_boundary
+    from src.infrastructure.visualization.debug_visualizer import save_debug_visualization
 
-def main() -> None:
     project_root = Path(__file__).resolve().parents[1]
     images_dir = project_root / "data" / "images"
     output_dir = project_root / "data" / "output"
@@ -137,7 +140,31 @@ def main() -> None:
     _write_reports(output_dir, report_rows)
 
 
+def run_ui_mode() -> None:
+    from src.presentation.main import launch_ui
+
+    raise SystemExit(launch_ui())
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="AFM Mesher runner")
+    parser.add_argument(
+        "--mode",
+        choices=("batch", "ui"),
+        default=DEFAULT_RUN_MODE,
+        help="batch: existing benchmark pipeline; ui: mask editor",
+    )
+    args = parser.parse_args()
+
+    if args.mode == "ui":
+        run_ui_mode()
+        return
+    run_batch_mode()
+
+
 def _estimate_reference_h(reference_image: Path) -> float | None:
+    from src.infrastructure.image.photo_preprocessor import preprocess_photo_to_boundary
+
     if not reference_image.exists():
         return None
     preprocessed = preprocess_photo_to_boundary(
