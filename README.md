@@ -22,6 +22,15 @@
 
 ## Алгоритми
 
+### Назви застосованих алгоритмів
+
+- **Advancing Front Method (AFM)** — основна триангуляція області.
+- **Laplacian Smoothing** — згладжування внутрішніх вузлів сітки.
+- **Ramer-Douglas-Peucker (RDP)** — спрощення контуру (`epsilon`).
+- **Ear Clipping Triangulation** — fallback-триангуляція при зупинці фронту.
+- **Ray Casting Point-in-Polygon test** — перевірка належності точки полігону.
+- **Segment Intersection Test (orientation-based)** — перевірка перетинів ребер.
+
 ### 1) Виділення межі з маски
 - `src/infrastructure/image/photo_preprocessor.py`
 - `src/infrastructure/processing/image_boundary_extractor.py`
@@ -171,4 +180,3 @@ python src/main.py --mode ui
 ```bash
 python src/main.py --mode batch
 ```
-
