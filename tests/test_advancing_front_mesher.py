@@ -2,7 +2,9 @@ import unittest
 
 import _bootstrap  # noqa: F401
 from src.application.services.advancing_front_mesher import AdvancingFrontMesher
+from src.domain.entities.mesh import Mesh
 from src.domain.entities.point import Point
+from src.domain.entities.triangle import Triangle
 from src.domain.geometry.geometry_utils import point_in_polygon
 
 
@@ -50,6 +52,21 @@ class TestAdvancingFrontMesher(unittest.TestCase):
         boundary = [Point(0.0, 0.0), Point(1.0, 1.0), Point(2.0, 2.0)]
         with self.assertRaises(ValueError):
             self.mesher.generate(boundary)
+
+    def test_build_topology_uses_global_linear_triangle_node_numbers(self) -> None:
+        mesh = Mesh(
+            triangles=[
+                Triangle(Point(0.0, 0.0), Point(1.0, 0.0), Point(0.0, 1.0)),
+                Triangle(Point(1.0, 0.0), Point(1.0, 1.0), Point(0.0, 1.0)),
+            ]
+        )
+        boundary = [Point(0.0, 0.0), Point(1.0, 0.0), Point(1.0, 1.0), Point(0.0, 1.0)]
+
+        positions, triangles, _, _, _ = self.mesher._build_topology(mesh, boundary)
+
+        self.assertEqual(sorted(positions.keys()), [1, 2, 3, 4])
+        self.assertEqual(triangles[0][1], triangles[1][0])
+        self.assertEqual(triangles[0][2], triangles[1][2])
 
     def _assert_triangles_inside_polygon(self, mesh, polygon: list[Point]) -> None:
         for triangle in mesh.triangles:

@@ -494,33 +494,39 @@ class AdvancingFrontMesher(IMeshGenerator):
         dict[int, list[int]],
         set[int],
     ]:
-        key_to_id: dict[tuple[float, float], int] = {}
+        linear_triangles = mesh.linear_triangles(key_precision=_KEY_PRECISION)
         positions: dict[int, Point] = {}
         adjacency: dict[int, set[int]] = {}
         node_triangles: dict[int, list[int]] = {}
         triangles: list[TriangleIds] = []
+        key_to_id: dict[tuple[float, float], int] = {}
 
-        def get_id(point: Point) -> int:
-            key = self._point_key(point)
-            if key in key_to_id:
-                return key_to_id[key]
-            node_id = len(key_to_id)
-            key_to_id[key] = node_id
-            positions[node_id] = point
-            adjacency[node_id] = set()
-            node_triangles[node_id] = []
-            return node_id
-
-        for tri_idx, triangle in enumerate(mesh.triangles):
-            a_id = get_id(triangle.a)
-            b_id = get_id(triangle.b)
-            c_id = get_id(triangle.c)
+        for linear_triangle in linear_triangles:
+            a_id, b_id, c_id = linear_triangle.node_numbers
+            a, b, c = linear_triangle.node_coordinates
             triangles.append((a_id, b_id, c_id))
+
+            if a_id not in positions:
+                positions[a_id] = a
+                key_to_id[self._point_key(a)] = a_id
+                adjacency[a_id] = set()
+                node_triangles[a_id] = []
+            if b_id not in positions:
+                positions[b_id] = b
+                key_to_id[self._point_key(b)] = b_id
+                adjacency[b_id] = set()
+                node_triangles[b_id] = []
+            if c_id not in positions:
+                positions[c_id] = c
+                key_to_id[self._point_key(c)] = c_id
+                adjacency[c_id] = set()
+                node_triangles[c_id] = []
 
             adjacency[a_id].update((b_id, c_id))
             adjacency[b_id].update((a_id, c_id))
             adjacency[c_id].update((a_id, b_id))
 
+            tri_idx = linear_triangle.triangle_number - 1
             node_triangles[a_id].append(tri_idx)
             node_triangles[b_id].append(tri_idx)
             node_triangles[c_id].append(tri_idx)

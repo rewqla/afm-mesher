@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections import deque
-
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
@@ -205,33 +203,48 @@ class Canvas(QWidget):
             painter.drawEllipse(QRect(self._shape_start, self._shape_end).normalized())
 
     def _flood_fill(self, seed: QPoint) -> None:
-        target = self._image.pixelColor(seed)
-        fill_color = QColor(Qt.GlobalColor.black)
+        target = self._image.pixel(seed.x(), seed.y())
+        fill_color = QColor(Qt.GlobalColor.black).rgb()
         if target == fill_color:
             return
 
         width = self._image.width()
         height = self._image.height()
-        queue: deque[QPoint] = deque([seed])
-        visited: set[tuple[int, int]] = set()
+        stack: list[tuple[int, int]] = [(seed.x(), seed.y())]
 
-        while queue:
-            point = queue.popleft()
-            x, y = point.x(), point.y()
+        while stack:
+            x, y = stack.pop()
             if not (0 <= x < width and 0 <= y < height):
                 continue
-            key = (x, y)
-            if key in visited:
+            if self._image.pixel(x, y) != target:
                 continue
-            visited.add(key)
 
-            if self._image.pixelColor(x, y) != target:
-                continue
-            self._image.setPixelColor(x, y, fill_color)
-            queue.append(QPoint(x + 1, y))
-            queue.append(QPoint(x - 1, y))
-            queue.append(QPoint(x, y + 1))
-            queue.append(QPoint(x, y - 1))
+            left = x
+            while left >= 0 and self._image.pixel(left, y) == target:
+                left -= 1
+            left += 1
+
+            right = x
+            while right < width and self._image.pixel(right, y) == target:
+                right += 1
+            right -= 1
+
+            for fill_x in range(left, right + 1):
+                self._image.setPixel(fill_x, y, fill_color)
+
+            for neighbor_y in (y - 1, y + 1):
+                if not (0 <= neighbor_y < height):
+                    continue
+                run_start: int | None = None
+                for scan_x in range(left, right + 1):
+                    if self._image.pixel(scan_x, neighbor_y) == target:
+                        if run_start is None:
+                            run_start = scan_x
+                    elif run_start is not None:
+                        stack.append(((run_start + scan_x - 1) // 2, neighbor_y))
+                        run_start = None
+                if run_start is not None:
+                    stack.append(((run_start + right) // 2, neighbor_y))
 
     def _draw_mesh_overlay(self, painter: QPainter, mesh: Mesh) -> None:
         pen = QPen(Qt.GlobalColor.red, 1, Qt.PenStyle.SolidLine)
