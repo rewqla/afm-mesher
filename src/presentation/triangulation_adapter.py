@@ -6,10 +6,17 @@ from typing import ClassVar
 from PySide6.QtGui import QColor, QImage
 
 from src.application.services.advancing_front_mesher import AdvancingFrontMesher
+from src.application.services.boundary_detection_service import BoundaryDetectionService
+from src.application.services.obstacle_processor import ObstacleProcessor
+from src.application.services.polygon_builder import PolygonBuilder
+from src.application.services.region_classifier import RegionClassifier
+from src.application.services.region_topology import ClassifiedRegion, RegionPolygon
+from src.domain.entities.point import Point
 from src.domain.entities.mesh import Mesh
 from src.domain.geometry.geometry_utils import mesh_average_quality
 from src.infrastructure.image.photo_preprocessor import simplify_contour
-from src.infrastructure.processing.image_boundary_extractor import contours_to_boundaries, extract_contours
+from src.infrastructure.processing.image_boundary_extractor import extract_contours
+from src.infrastructure.processing.stroke_centerline_extractor import extract_stroke_centerlines
 from src.presentation.tools import TriangulationMode
 
 
@@ -41,6 +48,9 @@ class TriangulationAdapter:
 
     threshold: int = 127
     _mesher: AdvancingFrontMesher = field(init=False, repr=False)
+    _boundary_detection: BoundaryDetectionService = field(init=False, repr=False)
+    _region_classifier: RegionClassifier = field(init=False, repr=False)
+    _obstacle_processor: ObstacleProcessor = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._mesher = AdvancingFrontMesher(
@@ -49,6 +59,9 @@ class TriangulationAdapter:
             target_edge_length=24.0,
             smoothing_iterations=2,
         )
+        self._boundary_detection = BoundaryDetectionService(PolygonBuilder())
+        self._region_classifier = RegionClassifier()
+        self._obstacle_processor = ObstacleProcessor()
 
     def run(
         self,
@@ -56,18 +69,33 @@ class TriangulationAdapter:
         mode: TriangulationMode = TriangulationMode.FAST,
         custom_settings: TriangulationSettings | None = None,
     ) -> tuple[Mesh, float]:
-        mask = self._qimage_to_mask(image_data)
-        contours = extract_contours(mask)
-        if not contours:
-            raise ValueError("No drawable obstacle found for triangulation.")
-
         settings = self._resolve_settings(mode, custom_settings)
-        selected_contour = max(contours, key=self._contour_area)
-        simplified_contour = simplify_contour(selected_contour, epsilon=settings.contour_epsilon)
-        if len(simplified_contour) < 3:
-            simplified_contour = selected_contour
+        raw_contours = self._extract_geometry_contours(image_data)
+        return self._run_with_contours(raw_contours, settings)
 
-        boundary = contours_to_boundaries([simplified_contour])[0]
+    def run_from_contours(
+        self,
+        contours: list[list[tuple[int, int]]],
+        mode: TriangulationMode = TriangulationMode.FAST,
+        custom_settings: TriangulationSettings | None = None,
+    ) -> tuple[Mesh, float]:
+        settings = self._resolve_settings(mode, custom_settings)
+        return self._run_with_contours(contours, settings)
+
+    def _run_with_contours(
+        self,
+        raw_contours: list[Contour],
+        settings: TriangulationSettings,
+    ) -> tuple[Mesh, float]:
+        polygons = self._build_polygons(raw_contours, settings.contour_epsilon)
+        regions = self._region_classifier.classify(polygons)
+        if not regions:
+            raise ValueError("No closed contour region found for triangulation.")
+        valid_region = self._select_valid_region(regions)
+        self._build_topology_graph(valid_region)
+
+        boundary = valid_region.shell.points
+        holes = self._obstacle_processor.extract_holes(valid_region)
         self._mesher = AdvancingFrontMesher(
             min_triangle_quality=settings.min_triangle_quality,
             max_iterations_factor=settings.max_iterations_factor,
@@ -75,6 +103,9 @@ class TriangulationAdapter:
             smoothing_iterations=settings.smoothing_iterations,
         )
         mesh = self._mesher.generate(boundary)
+        mesh = Mesh(triangles=self._obstacle_processor.filter_triangles_by_holes(mesh.triangles, holes))
+        if not mesh.triangles:
+            raise ValueError("Triangulation produced no valid triangles for the selected region.")
         coefficient = mesh_average_quality(mesh)
         return mesh, coefficient
 
@@ -114,20 +145,63 @@ class TriangulationAdapter:
             row: list[int] = []
             for x in range(width):
                 value = QColor(grayscale.pixel(x, y)).value()
-                # UI mode triangulates the white domain (background),
-                # while black pixels are internal obstacles.
-                row.append(1 if value > self.threshold else 0)
+                # Geometric contours are drawn in black; convert black regions to 1.
+                row.append(1 if value <= self.threshold else 0)
             mask.append(row)
         return mask
 
-    def _contour_area(self, contour: Contour) -> float:
+    def _extract_geometry_contours(self, image_data: QImage) -> list[Contour]:
+        mask = self._qimage_to_mask(image_data)
+        contours = extract_contours(mask)
+        if not contours:
+            raise ValueError("No contour geometry found.")
+        return contours
+
+    def extract_contours_from_image(self, image_data: QImage) -> list[Contour]:
+        return self._extract_geometry_contours(image_data)
+
+    def extract_stroke_contours_from_image(self, image_data: QImage) -> list[Contour]:
+        mask = self._qimage_to_mask(image_data)
+        contours = extract_stroke_centerlines(mask)
+        if not contours:
+            raise ValueError("No stroke geometry found.")
+        return contours
+
+    def _build_polygons(self, contours: list[Contour], epsilon: float) -> list[RegionPolygon]:
+        simplified: list[Contour] = []
+        for contour in contours:
+            simplified_contour = simplify_contour(contour, epsilon=epsilon)
+            if len(simplified_contour) < 3:
+                simplified_contour = contour
+            if simplified_contour[0] != simplified_contour[-1]:
+                simplified_contour = [*simplified_contour, simplified_contour[0]]
+            simplified.append(simplified_contour)
+        return self._boundary_detection.detect(simplified)
+
+    def _select_valid_region(self, regions: list[ClassifiedRegion]) -> ClassifiedRegion:
+        return max(regions, key=lambda region: self._polygon_area(region.shell.points))
+
+    def _polygon_area(self, contour: list[Point]) -> float:
         area = 0.0
         n = len(contour)
         for i in range(n):
-            x1, y1 = contour[i]
-            x2, y2 = contour[(i + 1) % n]
+            x1 = contour[i].x
+            y1 = contour[i].y
+            x2 = contour[(i + 1) % n].x
+            y2 = contour[(i + 1) % n].y
             area += x1 * y2 - x2 * y1
         return abs(area) / 2.0
+
+    def _build_topology_graph(self, region: ClassifiedRegion) -> dict[tuple[float, float], set[tuple[float, float]]]:
+        graph: dict[tuple[float, float], set[tuple[float, float]]] = {}
+        for polygon in [region.shell, *region.holes]:
+            points = polygon.points
+            for i in range(len(points)):
+                a = (points[i].x, points[i].y)
+                b = (points[(i + 1) % len(points)].x, points[(i + 1) % len(points)].y)
+                graph.setdefault(a, set()).add(b)
+                graph.setdefault(b, set()).add(a)
+        return graph
 
     def _resolve_settings(
         self,

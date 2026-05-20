@@ -34,12 +34,58 @@
 ### 1) Виділення межі з маски
 - `src/infrastructure/image/photo_preprocessor.py`
 - `src/infrastructure/processing/image_boundary_extractor.py`
+- `src/infrastructure/processing/stroke_centerline_extractor.py`
 
 Ключові ідеї:
 - межа формується з ребер foreground-пікселів;
 - ребра зшиваються в замкнені контури;
 - для складних випадків обирається найбільший зовнішній контур за площею;
 - контур спрощується RDP (`simplify_contour`).
+- для завантажених відкритих штрихів окремо витягується `centerline` через скелетизацію
+  (Zhang-Suen thinning + tracing connected component), щоб валідатор працював з полілінією
+  штриха, а не з товщиною чорної смуги.
+
+### 1.1) Валідація та постобробка контуру
+- `src/domain/geometry/contour_pipeline.py`
+- `src/application/services/boundary_validator.py`
+
+Поточний `Source of Truth` для векторного контуру:
+- всі user-drawn contours і contours, витягнуті із завантаженого зображення, проходять один і той самий
+  contour pipeline;
+- `BoundaryValidator` більше не має окремої геометричної логіки, а викликає `preprocess_contour`
+  і `validate_contour`.
+
+Алгоритм `preprocess_contour`:
+- видаляє послідовні дублікати точок за `epsilon`;
+- застосовує Ramer-Douglas-Peucker для прибирання мікро-зигзагів;
+- для сирого pen stroke шукає замикання від кінця до початку в межах `closure_tolerance`,
+  відрізає хвіст після точки замикання і робить hard snap `last = first`;
+- для already-closed contour (типово після image extraction) не трактує його як хвіст pen stroke
+  і зберігає явне замикання.
+
+Алгоритм `validate_contour`:
+- перевіряє, чи contour замкнений;
+- перевіряє самоперетини по відрізках;
+- ігнорує топологічно суміжні ребра;
+- окремо ловить дегенеративний розворот назад на сусідніх сегментах;
+- якщо є мікро-петля в зоні старт/фініш, пробує відновити найбільший валідний loop.
+
+Поведінка UI:
+- якщо contour не замкнений, триангуляція блокується;
+- в UI підсвічується лише останній open segment;
+- автодомальовування вимкнене.
+
+### 1.2) Домальовування контуру
+- `src/domain/geometry/contour_pipeline.py::smart_append_contour`
+- `src/presentation/canvas.py`
+
+Поточна логіка continuation:
+- при старті нового pen stroke `Canvas` шукає найближчий відкритий кінець існуючого contour;
+- continuation можливий як у `start`, так і в `end`;
+- орієнтація існуючого contour не перевертається глобально;
+- перші точки нового штриха проектуються на напрямок хвоста/голови базового contour,
+  щоб не утворювати шпору або зворотний гострий кут;
+- короткий corrective stroke теж приймається, якщо він продовжує вже існуючий open contour.
 
 ### 2) Advancing Front Mesher
 - `src/application/services/advancing_front_mesher.py`
@@ -141,6 +187,10 @@ tests/
 - preprocessing/contour extraction.
 
 Основні тестові модулі:
+- `test_contour_pipeline.py`
+- `test_boundary_validator.py`
+- `test_canvas_contour_integration.py`
+- `test_stroke_centerline_extractor.py`
 - `test_afm_invariants.py`
 - `test_afm_complex_quality.py`
 - `test_afm_mesh_integrity_extra.py`

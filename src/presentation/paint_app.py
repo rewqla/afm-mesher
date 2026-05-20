@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.domain.entities.mesh import Mesh
+from src.application.services.boundary_validator import BoundaryValidator
 from src.presentation.canvas import Canvas
 from src.presentation.tools import Tool, TriangulationMode
 from src.presentation.triangulation_adapter import TriangulationAdapter, TriangulationSettings
@@ -38,22 +39,31 @@ class TriangulationWorker(QObject):
         self,
         adapter: TriangulationAdapter,
         image_data: QImage,
+        contours: list[list[tuple[int, int]]],
         mode: TriangulationMode,
         custom_settings: TriangulationSettings | None,
     ) -> None:
         super().__init__()
         self._adapter = adapter
         self._image_data = image_data
+        self._contours = contours
         self._mode = mode
         self._custom_settings = custom_settings
 
     def run(self) -> None:
         try:
-            mesh, coefficient = self._adapter.run(
-                self._image_data,
-                mode=self._mode,
-                custom_settings=self._custom_settings,
-            )
+            if self._contours:
+                mesh, coefficient = self._adapter.run_from_contours(
+                    self._contours,
+                    mode=self._mode,
+                    custom_settings=self._custom_settings,
+                )
+            else:
+                mesh, coefficient = self._adapter.run(
+                    self._image_data,
+                    mode=self._mode,
+                    custom_settings=self._custom_settings,
+                )
         except Exception as error:  # noqa: BLE001
             self.failed.emit(str(error))
             return
@@ -66,6 +76,7 @@ class PaintApp(QMainWindow):
         self.setWindowTitle("AFM Mask Editor")
         self._canvas = Canvas()
         self._triangulation_adapter = TriangulationAdapter()
+        self._boundary_validator = BoundaryValidator()
         self._actions: dict[str, QAction] = {}
         self._tool_actions: dict[Tool, QAction] = {}
         self._tools_toolbar: QToolBar | None = None
@@ -101,6 +112,11 @@ class PaintApp(QMainWindow):
 
     def run_triangulation(self, image_data: QImage) -> tuple[Mesh, float]:
         mode, custom_settings = self._resolve_mode_and_settings()
+        contours = self._canvas.geometry_contours()
+        if not contours:
+            contours = self._refresh_geometry_from_canvas_image(image_data, prefer_strokes=True)
+        if contours:
+            return self._triangulation_adapter.run_from_contours(contours, mode=mode, custom_settings=custom_settings)
         return self._triangulation_adapter.run(image_data, mode=mode, custom_settings=custom_settings)
 
     def display_triangulation_result(self, mesh: Mesh, coefficient: float) -> None:
@@ -453,6 +469,23 @@ class PaintApp(QMainWindow):
             QLabel {
                 color: #cfd5df;
             }
+            QMessageBox {
+                background: #1a1e25;
+            }
+            QMessageBox QLabel {
+                color: #e5e7eb;
+            }
+            QMessageBox QPushButton {
+                color: #e5e7eb;
+                background: #262b35;
+                border: 1px solid #3b4558;
+                border-radius: 6px;
+                padding: 4px 10px;
+                min-width: 70px;
+            }
+            QMessageBox QPushButton:hover {
+                background: #30384a;
+            }
             QComboBox, QSpinBox, QDoubleSpinBox {
                 background: #11151d;
                 color: #e5e7eb;
@@ -592,6 +625,23 @@ class PaintApp(QMainWindow):
             }
             QLabel {
                 color: #334155;
+            }
+            QMessageBox {
+                background: #f8fafc;
+            }
+            QMessageBox QLabel {
+                color: #0f172a;
+            }
+            QMessageBox QPushButton {
+                color: #0f172a;
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 4px 10px;
+                min-width: 70px;
+            }
+            QMessageBox QPushButton:hover {
+                background: #f1f5f9;
             }
             QComboBox, QSpinBox, QDoubleSpinBox {
                 background: #ffffff;
@@ -754,6 +804,7 @@ class PaintApp(QMainWindow):
             return
         binary = Canvas.binarize_image(image, threshold=127)
         self._canvas.set_image(binary)
+        self._refresh_geometry_from_canvas_image(binary, prefer_strokes=True)
         self.statusBar().showMessage(f"Loaded: {path}")
 
     def _on_undo(self) -> None:
@@ -771,6 +822,36 @@ class PaintApp(QMainWindow):
     def _on_triangulation(self) -> None:
         if self._triangulation_busy:
             return
+        image_data = self._canvas.image_data()
+        drawn_contours = self._canvas.geometry_contours()
+        contours = drawn_contours if drawn_contours else self._refresh_geometry_from_canvas_image(
+            image_data,
+            prefer_strokes=True,
+        )
+        if contours:
+            validation = self._boundary_validator.validate(contours)
+            if not validation.is_valid:
+                self._canvas.set_invalid_segments(self._latest_open_segment(validation))
+                if validation.open_contours:
+                    QMessageBox.information(
+                        self,
+                        "Open Contour Detected",
+                        "Region boundary is not closed. "
+                        "Please close the highlighted gap manually before triangulation.",
+                    )
+                    return
+                if validation.self_intersections:
+                    QMessageBox.warning(
+                        self,
+                        "Invalid Geometry",
+                        "Contour contains self-intersections. Fix geometry before triangulation.",
+                    )
+                    return
+
+            contours = self._boundary_validator.normalize_closed_contours(contours)
+        else:
+            self._canvas.set_invalid_segments([])
+
         mode, custom_settings = self._resolve_mode_and_settings()
         if mode == TriangulationMode.CUSTOM and custom_settings is not None:
             try:
@@ -782,11 +863,11 @@ class PaintApp(QMainWindow):
         self.statusBar().showMessage("Triangulation in progress...")
         self._state_status_label.setText("Triangulating...")
 
-        image_data = self._canvas.image_data()
         self._triangulation_thread = QThread(self)
         self._triangulation_worker = TriangulationWorker(
             self._triangulation_adapter,
             image_data,
+            contours,
             mode,
             custom_settings,
         )
@@ -799,6 +880,33 @@ class PaintApp(QMainWindow):
         self._triangulation_worker.failed.connect(self._cleanup_triangulation_thread)
 
         self._triangulation_thread.start()
+
+    def _refresh_geometry_from_canvas_image(
+        self,
+        image_data: QImage,
+        *,
+        prefer_strokes: bool = False,
+    ) -> list[list[tuple[int, int]]]:
+        try:
+            if prefer_strokes:
+                contours = self._triangulation_adapter.extract_stroke_contours_from_image(image_data)
+            else:
+                contours = self._triangulation_adapter.extract_contours_from_image(image_data)
+        except ValueError:
+            self._canvas.set_geometry_contours([], preprocess=False, redraw_image=False, emit_change=False)
+            return []
+        self._canvas.set_geometry_contours(contours, preprocess=False, redraw_image=False, emit_change=False)
+        return self._canvas.geometry_contours()
+
+    def _latest_open_segment(
+        self,
+        validation,  # BoundaryValidationResult
+    ) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+        open_issues = [issue for issue in validation.open_contours if issue.segment is not None]
+        if not open_issues:
+            return []
+        latest = max(open_issues, key=lambda issue: issue.contour_index)
+        return [latest.segment] if latest.segment is not None else []
 
     def _on_triangulation_finished(self, mesh: object, coefficient: float) -> None:
         self._set_triangulation_busy(False)

@@ -4,6 +4,8 @@ from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
 
+from src.domain.entities.point import Point
+from src.domain.geometry.contour_pipeline import preprocess_contour, smart_append_contour
 from src.domain.entities.mesh import Mesh
 from src.presentation.tools import Tool
 
@@ -13,6 +15,9 @@ class Canvas(QWidget):
 
     def __init__(self, width: int = 900, height: int = 650, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._preprocess_epsilon = 0.75
+        self._closure_tolerance = 8.0
+        self._continuation_tolerance_sq = self._closure_tolerance * self._closure_tolerance
         self._image = QImage(width, height, QImage.Format.Format_RGB32)
         self._image.fill(Qt.GlobalColor.white)
         self._tool: Tool = Tool.PEN
@@ -23,6 +28,11 @@ class Canvas(QWidget):
         self._mesh_overlay: Mesh | None = None
         self._undo_stack: list[QImage] = []
         self._redo_stack: list[QImage] = []
+        self._geometry_contours: list[list[tuple[float, float]]] = []
+        self._invalid_segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        self._current_stroke: list[tuple[float, float]] = []
+        self._active_base_contour: list[tuple[float, float]] | None = None
+        self._active_attach_side = "end"
         self._max_history = 30
         self.setMinimumSize(width, height)
         self.setMouseTracking(True)
@@ -42,6 +52,8 @@ class Canvas(QWidget):
     def clear(self) -> None:
         self._push_undo_state()
         self._image.fill(Qt.GlobalColor.white)
+        self._geometry_contours.clear()
+        self._invalid_segments.clear()
         self._mesh_overlay = None
         self.update()
         self.image_changed.emit()
@@ -51,6 +63,8 @@ class Canvas(QWidget):
             self._push_undo_state()
         converted = image.convertToFormat(QImage.Format.Format_RGB32)
         self._image = converted
+        self._geometry_contours.clear()
+        self._invalid_segments.clear()
         self._mesh_overlay = None
         self.setMinimumSize(converted.width(), converted.height())
         self.resize(converted.size())
@@ -59,6 +73,31 @@ class Canvas(QWidget):
 
     def image_data(self) -> QImage:
         return self._image.copy()
+
+    def geometry_contours(self) -> list[list[tuple[float, float]]]:
+        return [[(x, y) for x, y in contour] for contour in self._geometry_contours]
+
+    def set_geometry_contours(
+        self,
+        contours: list[list[tuple[float, float]]],
+        *,
+        preprocess: bool = True,
+        redraw_image: bool = True,
+        emit_change: bool = True,
+    ) -> None:
+        self._geometry_contours = []
+        for contour in contours:
+            self._store_contour(contour, preprocess=preprocess)
+        if redraw_image:
+            self._redraw_geometry_layer()
+        self.update()
+        if emit_change:
+            self.image_changed.emit()
+
+    def set_invalid_segments(self, segments: list[tuple[tuple[float, float], tuple[float, float]]]) -> None:
+        normalized = [((a[0], a[1]), (b[0], b[1])) for a, b in segments]
+        self._invalid_segments = normalized[-1:]  # Always keep only latest visual hint.
+        self.update()
 
     def set_mesh_overlay(self, mesh: Mesh | None) -> None:
         self._mesh_overlay = mesh
@@ -69,6 +108,8 @@ class Canvas(QWidget):
             return False
         self._redo_stack.append(self._image.copy())
         self._image = self._undo_stack.pop()
+        self._geometry_contours.clear()
+        self._invalid_segments.clear()
         self._mesh_overlay = None
         self.update()
         self.image_changed.emit()
@@ -79,6 +120,8 @@ class Canvas(QWidget):
             return False
         self._undo_stack.append(self._image.copy())
         self._image = self._redo_stack.pop()
+        self._geometry_contours.clear()
+        self._invalid_segments.clear()
         self._mesh_overlay = None
         self.update()
         self.image_changed.emit()
@@ -93,10 +136,22 @@ class Canvas(QWidget):
             return
 
         self._mesh_overlay = None
+        self._invalid_segments.clear()
+        self._active_base_contour = None
+        self._active_attach_side = "end"
         if self._tool in (Tool.PEN, Tool.ERASER):
             self._push_undo_state()
             self._drawing = True
             self._last_point = point
+            if self._tool == Tool.PEN:
+                self._active_base_contour, self._active_attach_side, stroke_start = self._take_continuation_target(
+                    point.x(),
+                    point.y(),
+                )
+                self._current_stroke = [stroke_start]
+                if self._current_stroke:
+                    sx, sy = self._current_stroke[-1]
+                    self._last_point = QPoint(int(round(sx)), int(round(sy)))
         elif self._tool == Tool.FILL:
             self._push_undo_state()
             self._flood_fill(point)
@@ -125,6 +180,8 @@ class Canvas(QWidget):
             painter.drawLine(self._last_point, point)
             painter.end()
             self._last_point = point
+            if self._tool == Tool.PEN:
+                self._current_stroke.append((float(point.x()), float(point.y())))
             self.update()
             self.image_changed.emit()
             return
@@ -143,6 +200,8 @@ class Canvas(QWidget):
             self._shape_end = event.position().toPoint()
             self._commit_shape()
             self.image_changed.emit()
+        elif self._tool == Tool.PEN:
+            self._maybe_commit_pen_contour()
 
         self._drawing = False
         self._shape_start = None
@@ -155,6 +214,8 @@ class Canvas(QWidget):
 
         if self._drawing and self._tool in (Tool.SEGMENT, Tool.RECTANGLE, Tool.CIRCLE):
             self._draw_shape_preview(painter)
+        if self._invalid_segments:
+            self._draw_invalid_segments(painter)
         if self._mesh_overlay is not None:
             self._draw_mesh_overlay(painter, self._mesh_overlay)
 
@@ -169,6 +230,7 @@ class Canvas(QWidget):
         painter.setBrush(Qt.GlobalColor.black)
         painter.drawEllipse(point, 4, 4)
         painter.end()
+        self._append_circle_contour(point, 4)
 
     def _commit_shape(self) -> None:
         if self._shape_start is None or self._shape_end is None:
@@ -184,9 +246,18 @@ class Canvas(QWidget):
         elif self._tool == Tool.RECTANGLE:
             rect = QRect(self._shape_start, self._shape_end).normalized()
             painter.drawRect(rect)
+            contour = [
+                (rect.left(), rect.top()),
+                (rect.right(), rect.top()),
+                (rect.right(), rect.bottom()),
+                (rect.left(), rect.bottom()),
+                (rect.left(), rect.top()),
+            ]
+            self._geometry_contours.append(contour)
         elif self._tool == Tool.CIRCLE:
             rect = QRect(self._shape_start, self._shape_end).normalized()
             painter.drawEllipse(rect)
+            self._append_ellipse_contour(rect)
         painter.end()
 
     def _draw_shape_preview(self, painter: QPainter) -> None:
@@ -258,6 +329,12 @@ class Canvas(QWidget):
             painter.drawLine(b, c)
             painter.drawLine(c, a)
 
+    def _draw_invalid_segments(self, painter: QPainter) -> None:
+        pen = QPen(Qt.GlobalColor.yellow, 3, Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        for (x1, y1), (x2, y2) in self._invalid_segments:
+            painter.drawLine(QPoint(int(round(x1)), int(round(y1))), QPoint(int(round(x2)), int(round(y2))))
+
     def _in_bounds(self, point: QPoint) -> bool:
         return 0 <= point.x() < self._image.width() and 0 <= point.y() < self._image.height()
 
@@ -266,6 +343,146 @@ class Canvas(QWidget):
         if len(self._undo_stack) > self._max_history:
             self._undo_stack.pop(0)
         self._redo_stack.clear()
+
+    def _maybe_commit_pen_contour(self) -> None:
+        min_points = 2 if self._active_base_contour is not None else 4
+        if len(self._current_stroke) < min_points:
+            self._current_stroke = []
+            self._active_base_contour = None
+            self._active_attach_side = "end"
+            return
+        contour_points = self._to_points(self._current_stroke)
+        contour_points = preprocess_contour(
+            contour_points,
+            epsilon=self._preprocess_epsilon,
+            closure_tolerance=self._closure_tolerance,
+        )
+        if self._active_base_contour is not None:
+            base_points = self._to_points(self._active_base_contour)
+            contour_points = smart_append_contour(
+                base_points,
+                contour_points,
+                self._closure_tolerance,
+                attach_to=self._active_attach_side,
+            )
+            contour_points = preprocess_contour(
+                contour_points,
+                epsilon=self._preprocess_epsilon,
+                closure_tolerance=self._closure_tolerance,
+            )
+        self._store_contour([(point.x, point.y) for point in contour_points])
+        self._redraw_geometry_layer()
+        self._current_stroke = []
+        self._active_base_contour = None
+        self._active_attach_side = "end"
+
+    def _append_circle_contour(self, center: QPoint, radius: int, segments: int = 20) -> None:
+        from math import cos, pi, sin
+
+        contour: list[tuple[int, int]] = []
+        for i in range(segments):
+            angle = 2.0 * pi * i / segments
+            x = int(round(center.x() + radius * cos(angle)))
+            y = int(round(center.y() + radius * sin(angle)))
+            contour.append((x, y))
+        contour.append(contour[0])
+        self._store_contour(contour)
+
+    def _append_ellipse_contour(self, rect: QRect, segments: int = 40) -> None:
+        from math import cos, pi, sin
+
+        cx = rect.center().x()
+        cy = rect.center().y()
+        rx = max(1, rect.width() / 2.0)
+        ry = max(1, rect.height() / 2.0)
+        contour: list[tuple[int, int]] = []
+        for i in range(segments):
+            angle = 2.0 * pi * i / segments
+            x = int(round(cx + rx * cos(angle)))
+            y = int(round(cy + ry * sin(angle)))
+            contour.append((x, y))
+        contour.append(contour[0])
+        self._store_contour(contour)
+
+    def _redraw_geometry_layer(self) -> None:
+        self._image.fill(Qt.GlobalColor.white)
+        painter = QPainter(self._image)
+        pen = QPen(Qt.GlobalColor.black, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for contour in self._geometry_contours:
+            if len(contour) < 2:
+                continue
+            for i in range(len(contour) - 1):
+                x1, y1 = contour[i]
+                x2, y2 = contour[i + 1]
+                painter.drawLine(
+                    QPoint(int(round(x1)), int(round(y1))),
+                    QPoint(int(round(x2)), int(round(y2))),
+                )
+        painter.end()
+
+    def _take_continuation_target(
+        self,
+        x: float,
+        y: float,
+    ) -> tuple[list[tuple[float, float]] | None, str, tuple[float, float]]:
+        if not self._geometry_contours:
+            return None, "end", (float(x), float(y))
+
+        best_idx = -1
+        attach_side = "end"
+        best_dist = self._continuation_tolerance_sq + 1.0
+        for idx, contour in enumerate(self._geometry_contours):
+            if len(contour) < 2 or self._contour_is_closed(contour):
+                continue
+            start = contour[0]
+            end = contour[-1]
+            start_dist = self._distance_sq(start, (x, y))
+            end_dist = self._distance_sq(end, (x, y))
+            if start_dist <= self._continuation_tolerance_sq and start_dist < best_dist:
+                best_idx = idx
+                attach_side = "start"
+                best_dist = start_dist
+            if end_dist <= self._continuation_tolerance_sq and end_dist < best_dist:
+                best_idx = idx
+                attach_side = "end"
+                best_dist = end_dist
+
+        if best_idx < 0:
+            return None, "end", (float(x), float(y))
+
+        target = self._geometry_contours.pop(best_idx)
+        anchor = target[0] if attach_side == "start" else target[-1]
+        return target, attach_side, anchor
+
+    def _store_contour(self, contour: list[tuple[float, float]], *, preprocess: bool = True) -> None:
+        if len(contour) < 2:
+            return
+        if preprocess:
+            processed = preprocess_contour(
+                self._to_points(contour),
+                epsilon=self._preprocess_epsilon,
+                closure_tolerance=self._closure_tolerance,
+            )
+        else:
+            processed = self._to_points(contour)
+        if len(processed) < 2:
+            return
+        self._geometry_contours.append([(point.x, point.y) for point in processed])
+
+    def _contour_is_closed(self, contour: list[tuple[float, float]]) -> bool:
+        if len(contour) < 4:
+            return False
+        return self._distance_sq(contour[0], contour[-1]) <= 1e-6
+
+    def _to_points(self, contour: list[tuple[float, float]]) -> list[Point]:
+        return [Point(float(x), float(y)) for x, y in contour]
+
+    def _distance_sq(self, a: tuple[float, float], b: tuple[float, float]) -> float:
+        dx = float(a[0]) - float(b[0])
+        dy = float(a[1]) - float(b[1])
+        return dx * dx + dy * dy
 
     @staticmethod
     def binarize_image(image: QImage, threshold: int = 127) -> QImage:
