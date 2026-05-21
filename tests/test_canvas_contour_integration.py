@@ -62,6 +62,48 @@ class TestCanvasContourIntegration(unittest.TestCase):
         contour = canvas.geometry_contours()[0]
         self.assertEqual(contour[0], contour[-1])
 
+    def test_resize_canvas_allows_growing_blank_canvas(self) -> None:
+        canvas = Canvas(width=300, height=300)
+
+        success, message = canvas.resize_canvas(640, 480, record_history=False)
+
+        self.assertTrue(success)
+        self.assertIsNone(message)
+        self.assertEqual(canvas.canvas_size().width(), 640)
+        self.assertEqual(canvas.canvas_size().height(), 480)
+
+    def test_resize_canvas_blocks_when_drawn_content_would_overflow(self) -> None:
+        canvas = Canvas(width=300, height=300)
+        canvas.set_geometry_contours(
+            [[(20.0, 20.0), (280.0, 20.0), (280.0, 40.0), (20.0, 40.0), (20.0, 20.0)]],
+            preprocess=False,
+            redraw_image=True,
+            emit_change=False,
+        )
+
+        success, message = canvas.resize_canvas(256, 256, record_history=False)
+
+        self.assertFalse(success)
+        self.assertIsNotNone(message)
+        self.assertIn("would fall outside the canvas", message)
+        self.assertEqual(canvas.canvas_size().width(), 300)
+        self.assertEqual(canvas.canvas_size().height(), 300)
+
+    def test_resize_canvas_blocks_when_hidden_geometry_would_overflow(self) -> None:
+        canvas = Canvas(width=300, height=300)
+        canvas.set_geometry_contours(
+            [[(10.0, 10.0), (290.0, 10.0), (290.0, 290.0), (10.0, 290.0), (10.0, 10.0)]],
+            preprocess=False,
+            redraw_image=False,
+            emit_change=False,
+        )
+
+        success, message = canvas.resize_canvas(280, 280, record_history=False)
+
+        self.assertFalse(success)
+        self.assertIsNotNone(message)
+        self.assertIn("x=10..290", message)
+
 
 if __name__ == "__main__":
     unittest.main()

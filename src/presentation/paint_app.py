@@ -71,6 +71,14 @@ class TriangulationWorker(QObject):
 
 
 class PaintApp(QMainWindow):
+    _CANVAS_SIZE_PRESETS: tuple[tuple[str, tuple[int, int]], ...] = (
+        ("VGA 640 x 480", (640, 480)),
+        ("SVGA 800 x 600", (800, 600)),
+        ("XGA 1024 x 768", (1024, 768)),
+        ("HD 1280 x 720", (1280, 720)),
+        ("Full HD 1920 x 1080", (1920, 1080)),
+    )
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("AFM Mask Editor")
@@ -90,9 +98,14 @@ class PaintApp(QMainWindow):
         self._state_status_label = QLabel("Idle")
         self._mode_status_label = QLabel("Triangulation: Balanced")
         self._status_progress = QProgressBar()
+        self._canvas_resize_in_progress = False
 
         self._mode_combo: QComboBox
         self._theme_combo: QComboBox
+        self._size_preset_combo: QComboBox
+        self._canvas_width_spin: QSpinBox
+        self._canvas_height_spin: QSpinBox
+        self._canvas_size_feedback: QLabel
         self._custom_checkbox: QCheckBox
         self._h_spin: QDoubleSpinBox
         self._smooth_spin: QSpinBox
@@ -211,6 +224,51 @@ class PaintApp(QMainWindow):
         self._theme_combo.setCurrentIndex(1 if initial_theme == "light" else 0)
         self._theme_combo.currentIndexChanged.connect(self._on_theme_changed)
         layout.addRow("Theme:", self._theme_combo)
+
+        size_group = QGroupBox("Canvas Size")
+        size_form = QFormLayout(size_group)
+
+        self._size_preset_combo = QComboBox()
+        for label, size in self._CANVAS_SIZE_PRESETS:
+            if (
+                Canvas.MIN_WIDTH <= size[0] <= Canvas.MAX_WIDTH
+                and Canvas.MIN_HEIGHT <= size[1] <= Canvas.MAX_HEIGHT
+            ):
+                self._size_preset_combo.addItem(label, size)
+        self._size_preset_combo.addItem("Custom", "custom")
+        self._size_preset_combo.currentIndexChanged.connect(self._on_canvas_preset_changed)
+        size_form.addRow("Preset:", self._size_preset_combo)
+
+        self._canvas_width_spin = QSpinBox()
+        self._canvas_width_spin.setRange(Canvas.MIN_WIDTH, Canvas.MAX_WIDTH)
+        self._canvas_width_spin.setSingleStep(16)
+        self._canvas_width_spin.setSuffix(" px")
+        self._canvas_width_spin.setKeyboardTracking(False)
+        self._canvas_width_spin.valueChanged.connect(self._on_custom_canvas_size_changed)
+        size_form.addRow("Width:", self._canvas_width_spin)
+
+        self._canvas_height_spin = QSpinBox()
+        self._canvas_height_spin.setRange(Canvas.MIN_HEIGHT, Canvas.MAX_HEIGHT)
+        self._canvas_height_spin.setSingleStep(16)
+        self._canvas_height_spin.setSuffix(" px")
+        self._canvas_height_spin.setKeyboardTracking(False)
+        self._canvas_height_spin.valueChanged.connect(self._on_custom_canvas_size_changed)
+        size_form.addRow("Height:", self._canvas_height_spin)
+
+        limits_label = QLabel(
+            f"Allowed range: {Canvas.MIN_WIDTH}-{Canvas.MAX_WIDTH}px width, "
+            f"{Canvas.MIN_HEIGHT}-{Canvas.MAX_HEIGHT}px height."
+        )
+        limits_label.setWordWrap(True)
+        size_form.addRow("", limits_label)
+
+        self._canvas_size_feedback = QLabel("")
+        self._canvas_size_feedback.setWordWrap(True)
+        self._canvas_size_feedback.hide()
+        size_form.addRow("", self._canvas_size_feedback)
+
+        self._sync_canvas_size_controls(*self._current_canvas_dimensions())
+        layout.addRow(size_group)
 
         self._mode_combo = QComboBox()
         self._mode_combo.addItem("Fast", TriangulationMode.FAST.value)
@@ -337,6 +395,92 @@ class PaintApp(QMainWindow):
 
     def _on_theme_changed(self) -> None:
         self._apply_theme(str(self._theme_combo.currentData()))
+
+    def _current_canvas_dimensions(self) -> tuple[int, int]:
+        size = self._canvas.canvas_size()
+        return size.width(), size.height()
+
+    def _sync_canvas_size_controls(self, width: int, height: int) -> None:
+        self._canvas_resize_in_progress = True
+        try:
+            self._canvas_width_spin.setValue(width)
+            self._canvas_height_spin.setValue(height)
+            preset_index = self._matching_canvas_preset_index(width, height)
+            self._size_preset_combo.setCurrentIndex(preset_index)
+        finally:
+            self._canvas_resize_in_progress = False
+
+    def _matching_canvas_preset_index(self, width: int, height: int) -> int:
+        for index in range(self._size_preset_combo.count()):
+            data = self._size_preset_combo.itemData(index)
+            if isinstance(data, tuple) and data == (width, height):
+                return index
+        return self._size_preset_combo.count() - 1
+
+    def _set_canvas_feedback(self, message: str, *, error: bool) -> None:
+        self._canvas_size_feedback.setText(message)
+        self._canvas_size_feedback.setStyleSheet("color: #dc2626;" if error else "color: #16a34a;")
+        self._canvas_size_feedback.setVisible(bool(message))
+
+    def _resize_window_for_canvas_change(
+        self,
+        old_width: int,
+        old_height: int,
+        new_width: int,
+        new_height: int,
+    ) -> None:
+        if self.isMaximized() or self.isFullScreen():
+            return
+        width_delta = new_width - old_width
+        height_delta = new_height - old_height
+        target_width = max(1, self.width() + width_delta)
+        target_height = max(1, self.height() + height_delta)
+        self.resize(target_width, target_height)
+
+    def _apply_canvas_resize(self, width: int, height: int, *, show_error_dialog: bool) -> bool:
+        if self._canvas_resize_in_progress:
+            return False
+        self._canvas_resize_in_progress = True
+        try:
+            old_width, old_height = self._current_canvas_dimensions()
+            success, message = self._canvas.resize_canvas(width, height)
+            if not success:
+                current_width, current_height = self._current_canvas_dimensions()
+                self._sync_canvas_size_controls(current_width, current_height)
+                error_message = message or "Failed to resize canvas."
+                self._set_canvas_feedback(error_message, error=True)
+                if show_error_dialog:
+                    QMessageBox.warning(self, "Canvas Resize Blocked", error_message)
+                return False
+            self._sync_canvas_size_controls(width, height)
+            self._resize_window_for_canvas_change(old_width, old_height, width, height)
+            self._set_canvas_feedback(f"Canvas resized to {width} x {height}px.", error=False)
+            self.statusBar().showMessage(f"Canvas resized to {width} x {height}px")
+            return True
+        finally:
+            self._canvas_resize_in_progress = False
+
+    def _on_canvas_preset_changed(self) -> None:
+        if self._canvas_resize_in_progress:
+            return
+        size = self._size_preset_combo.currentData()
+        if size == "custom" or not isinstance(size, tuple):
+            return
+        width, height = size
+        self._apply_canvas_resize(width, height, show_error_dialog=True)
+
+    def _on_custom_canvas_size_changed(self) -> None:
+        if self._canvas_resize_in_progress:
+            return
+        width = int(self._canvas_width_spin.value())
+        height = int(self._canvas_height_spin.value())
+        custom_index = self._size_preset_combo.count() - 1
+        self._canvas_resize_in_progress = True
+        try:
+            self._size_preset_combo.setCurrentIndex(custom_index)
+        finally:
+            self._canvas_resize_in_progress = False
+        self._apply_canvas_resize(width, height, show_error_dialog=True)
 
     def _spinbox_controls_stylesheet(self, *, dark: bool) -> str:
         icons_dir = (Path(__file__).resolve().parent / "assets" / "icons").as_posix()

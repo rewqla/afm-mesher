@@ -12,6 +12,10 @@ from src.presentation.tools import Tool
 
 class Canvas(QWidget):
     image_changed = Signal()
+    MIN_WIDTH = 256
+    MIN_HEIGHT = 256
+    MAX_WIDTH = 4096
+    MAX_HEIGHT = 4096
 
     def __init__(self, width: int = 900, height: int = 650, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -74,8 +78,51 @@ class Canvas(QWidget):
     def image_data(self) -> QImage:
         return self._image.copy()
 
+    def canvas_size(self) -> QSize:
+        return self._image.size()
+
     def geometry_contours(self) -> list[list[tuple[float, float]]]:
         return [[(x, y) for x, y in contour] for contour in self._geometry_contours]
+
+    def resize_canvas(self, width: int, height: int, *, record_history: bool = True) -> tuple[bool, str | None]:
+        if width < self.MIN_WIDTH or height < self.MIN_HEIGHT:
+            return False, (
+                f"Canvas size must be at least {self.MIN_WIDTH} x {self.MIN_HEIGHT}px."
+            )
+        if width > self.MAX_WIDTH or height > self.MAX_HEIGHT:
+            return False, (
+                f"Canvas size must not exceed {self.MAX_WIDTH} x {self.MAX_HEIGHT}px."
+            )
+
+        content_bounds = self._content_bounds()
+        if content_bounds is not None:
+            min_x, min_y, max_x, max_y = content_bounds
+            if max_x >= width or max_y >= height:
+                return False, (
+                    f"Cannot apply {width} x {height}px. Existing content occupies "
+                    f"x={min_x}..{max_x}, y={min_y}..{max_y} and would fall outside the canvas."
+                )
+
+        if width == self._image.width() and height == self._image.height():
+            return True, None
+
+        if record_history:
+            self._push_undo_state()
+
+        resized = QImage(width, height, QImage.Format.Format_RGB32)
+        resized.fill(Qt.GlobalColor.white)
+        painter = QPainter(resized)
+        painter.drawImage(0, 0, self._image)
+        painter.end()
+
+        self._image = resized
+        self._mesh_overlay = None
+        self.setMinimumSize(width, height)
+        self.resize(width, height)
+        self.updateGeometry()
+        self.update()
+        self.image_changed.emit()
+        return True, None
 
     def set_geometry_contours(
         self,
@@ -483,6 +530,52 @@ class Canvas(QWidget):
         dx = float(a[0]) - float(b[0])
         dy = float(a[1]) - float(b[1])
         return dx * dx + dy * dy
+
+    def _content_bounds(self) -> tuple[int, int, int, int] | None:
+        raster_bounds = self._raster_content_bounds()
+        contour_bounds = self._contour_content_bounds()
+        if raster_bounds is None:
+            return contour_bounds
+        if contour_bounds is None:
+            return raster_bounds
+        return (
+            min(raster_bounds[0], contour_bounds[0]),
+            min(raster_bounds[1], contour_bounds[1]),
+            max(raster_bounds[2], contour_bounds[2]),
+            max(raster_bounds[3], contour_bounds[3]),
+        )
+
+    def _raster_content_bounds(self) -> tuple[int, int, int, int] | None:
+        white = QColor(Qt.GlobalColor.white).rgb()
+        min_x = self._image.width()
+        min_y = self._image.height()
+        max_x = -1
+        max_y = -1
+        for y in range(self._image.height()):
+            for x in range(self._image.width()):
+                if self._image.pixel(x, y) == white:
+                    continue
+                min_x = min(min_x, x)
+                min_y = min(min_y, y)
+                max_x = max(max_x, x)
+                max_y = max(max_y, y)
+        if max_x < 0 or max_y < 0:
+            return None
+        return (min_x, min_y, max_x, max_y)
+
+    def _contour_content_bounds(self) -> tuple[int, int, int, int] | None:
+        if not self._geometry_contours:
+            return None
+        xs = [point[0] for contour in self._geometry_contours for point in contour]
+        ys = [point[1] for contour in self._geometry_contours for point in contour]
+        if not xs or not ys:
+            return None
+        return (
+            int(round(min(xs))),
+            int(round(min(ys))),
+            int(round(max(xs))),
+            int(round(max(ys))),
+        )
 
     @staticmethod
     def binarize_image(image: QImage, threshold: int = 127) -> QImage:
