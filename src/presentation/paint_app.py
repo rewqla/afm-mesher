@@ -30,6 +30,18 @@ from src.presentation.canvas import Canvas
 from src.presentation.tools import Tool, TriangulationMode
 from src.presentation.triangulation_adapter import TriangulationAdapter, TriangulationSettings
 
+TRIANGULATION_INFO_DIALOG_TEXT = (
+    "Зверніть увагу на особливості роботи з включеннями та розрізами перед початком тріангуляції:\n\n"
+    "1. Включення (замкнені області всередині основної області):\n"
+    "• Під час тріангуляції основної області включення може не враховуватись.\n"
+    "• Якщо включення враховується, тоді сітка будується окремо для основної області та для "
+    "включення. По їхній спільній межі трикутники не заходять один в один. Вузли на цій межі "
+    "матимуть окремі номери для кожної з областей.\n\n"
+    "2. Розріз (лінія всередині області):\n"
+    "• Під час тріангуляції такий розріз обходиться з обох сторін. Тобто він працює як межа, "
+    "у якої є дві окремі сторони."
+)
+
 
 class TriangulationWorker(QObject):
     finished = Signal(object, float)
@@ -175,6 +187,7 @@ class PaintApp(QMainWindow):
             "Redo": ("Redo last action", self._on_redo),
             "Save": ("Save image to PNG/JPG", self._on_save),
             "Load": ("Load image from PNG/JPG", self._on_load),
+            "Info": ("Show triangulation info", self.show_triangulation_info_dialog),
             "Triangulation": ("Run triangulation", self._on_triangulation),
             "Clear": ("Clear canvas", self._canvas.clear),
         }
@@ -932,6 +945,21 @@ class PaintApp(QMainWindow):
         if mode != TriangulationMode.CUSTOM:
             return mode, settings
         return mode, settings
+
+    def _build_triangulation_info_dialog(self) -> QMessageBox:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Triangulation Info")
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setText(TRIANGULATION_INFO_DIALOG_TEXT)
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        ok_button = dialog.button(QMessageBox.StandardButton.Ok)
+        if ok_button is not None:
+            ok_button.setText("Продовжити")
+        return dialog
+
+    def show_triangulation_info_dialog(self) -> None:
+        self._build_triangulation_info_dialog().exec()
 
     def _on_save(self) -> None:
         path, selected_filter = QFileDialog.getSaveFileName(
