@@ -97,6 +97,23 @@ class TestDomainEntities(unittest.TestCase):
         self.assertEqual(linear[0].node_numbers[2], linear[1].node_numbers[2])
         self.assertEqual(sorted({n for t in linear for n in t.node_numbers}), [1, 2, 3, 4])
 
+    def test_mesh_propagates_meters_per_pixel_to_linear_triangles(self) -> None:
+        mesh = Mesh(
+            triangles=[
+                Triangle(
+                    a=Point(0.0, 0.0),
+                    b=Point(100.0, 0.0),
+                    c=Point(0.0, 100.0),
+                ),
+            ],
+            meters_per_pixel=0.01,
+        )
+
+        linear = mesh.linear_triangles()
+        self.assertEqual(len(linear), 1)
+        self.assertAlmostEqual(linear[0].area, 5000.0, places=12)
+        self.assertAlmostEqual(linear[0].physical_area, 0.5, places=12)
+
 
 if __name__ == "__main__":
     unittest.main()

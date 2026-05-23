@@ -112,6 +112,7 @@ class PaintApp(QMainWindow):
         self._epsilon_spin: QDoubleSpinBox
         self._iter_factor_spin: QSpinBox
         self._quality_spin: QDoubleSpinBox
+        self._meters_per_pixel_spin: QDoubleSpinBox
 
         self._build_central_workspace()
         self._build_toolbar()
@@ -330,6 +331,19 @@ class PaintApp(QMainWindow):
         self._quality_spin.setDecimals(3)
         self._quality_spin.setToolTip("Minimum accepted triangle quality.")
         manual_form.addRow("Min triangle quality:", self._quality_spin)
+
+        self._meters_per_pixel_spin = QDoubleSpinBox()
+        self._meters_per_pixel_spin.setRange(
+            TriangulationAdapter.MIN_METERS_PER_PIXEL,
+            TriangulationAdapter.MAX_METERS_PER_PIXEL,
+        )
+        self._meters_per_pixel_spin.setSingleStep(0.001)
+        self._meters_per_pixel_spin.setDecimals(6)
+        self._meters_per_pixel_spin.setValue(1.0)
+        self._meters_per_pixel_spin.setToolTip(
+            "Physical scale in meters per pixel. Physical area = pixel area * (m/px)^2."
+        )
+        manual_form.addRow("Scale (m/px):", self._meters_per_pixel_spin)
 
         layout.addRow(manual_group)
         self._mode_combo.setCurrentIndex(1)
@@ -903,18 +917,20 @@ class PaintApp(QMainWindow):
             self._quality_spin,
         ):
             control.setEnabled(enable_custom)
+        self._meters_per_pixel_spin.setEnabled(True)
 
     def _resolve_mode_and_settings(self) -> tuple[TriangulationMode, TriangulationSettings | None]:
         mode = self._triangulation_mode
-        if mode != TriangulationMode.CUSTOM:
-            return mode, None
         settings = TriangulationSettings(
             target_edge_length=float(self._h_spin.value()),
             smoothing_iterations=int(self._smooth_spin.value()),
             contour_epsilon=float(self._epsilon_spin.value()),
             max_iterations_factor=int(self._iter_factor_spin.value()),
             min_triangle_quality=float(self._quality_spin.value()),
+            meters_per_pixel=float(self._meters_per_pixel_spin.value()),
         )
+        if mode != TriangulationMode.CUSTOM:
+            return mode, settings
         return mode, settings
 
     def _on_save(self) -> None:
@@ -1101,8 +1117,15 @@ class PaintApp(QMainWindow):
             triangulation_action.setEnabled(not busy)
         self._mode_combo.setEnabled(not busy)
         self._custom_checkbox.setEnabled(not busy and TriangulationMode(self._mode_combo.currentData()) != TriangulationMode.CUSTOM)
-        for control in (self._h_spin, self._smooth_spin, self._epsilon_spin, self._iter_factor_spin, self._quality_spin):
+        for control in (
+            self._h_spin,
+            self._smooth_spin,
+            self._epsilon_spin,
+            self._iter_factor_spin,
+            self._quality_spin,
+        ):
             control.setEnabled(control.isEnabled() and not busy)
+        self._meters_per_pixel_spin.setEnabled(not busy)
         self._canvas.setEnabled(not busy)
         self._status_progress.setVisible(busy)
         self.setCursor(Qt.CursorShape.WaitCursor if busy else Qt.CursorShape.ArrowCursor)

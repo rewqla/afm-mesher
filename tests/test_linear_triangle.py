@@ -185,6 +185,24 @@ class TestLinearTriangle(unittest.TestCase):
         self.assertNotEqual(t.triangle_number, len(t.node_numbers))
         self.assertNotEqual(t.triangle_number, t.node_numbers[0])
 
+    def test_21_computes_physical_area_without_affecting_geometry_logic(self) -> None:
+        triangle = LinearTriangle(
+            triangle_number=5,
+            node_coordinates=(Point(0.0, 0.0), Point(100.0, 0.0), Point(0.0, 100.0)),
+            node_numbers=(10, 20, 30),
+            meters_per_pixel=0.01,
+        )
+        self.assertAlmostEqual(triangle.area, 5000.0, places=12)
+        self.assertAlmostEqual(triangle.physical_area, 0.5, places=12)
+        self.assertAlmostEqual(triangle.physical_area_value, 0.5, places=12)
+        self.assertEqual(triangle.orientation(), 1)
+        self.assertEqual(triangle.node_numbers, (10, 20, 30))
+
+        i, j, k = triangle.node_coordinates
+        self.assertAlmostEqual(triangle.phi_i(i.x, i.y), 1.0, places=12)
+        self.assertAlmostEqual(triangle.phi_j(j.x, j.y), 1.0, places=12)
+        self.assertAlmostEqual(triangle.phi_k(k.x, k.y), 1.0, places=12)
+
 
 if __name__ == "__main__":
     unittest.main()

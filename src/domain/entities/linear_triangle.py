@@ -13,7 +13,9 @@ _AREA_EPSILON = 1e-12
 class LinearTriangle(Triangle):
     triangle_number: int
     node_numbers: tuple[int, int, int]
+    meters_per_pixel: float
     area: float = field(init=False)
+    physical_area: float = field(init=False)
     _phi_i_coeffs: tuple[float, float, float] = field(init=False, repr=False)
     _phi_j_coeffs: tuple[float, float, float] = field(init=False, repr=False)
     _phi_k_coeffs: tuple[float, float, float] = field(init=False, repr=False)
@@ -23,6 +25,7 @@ class LinearTriangle(Triangle):
         triangle_number: int,
         node_coordinates: tuple[Point, Point, Point],
         node_numbers: tuple[int, int, int],
+        meters_per_pixel: float = 1.0,
     ) -> None:
         coordinates = tuple(node_coordinates)
         numbers = tuple(node_numbers)
@@ -37,6 +40,8 @@ class LinearTriangle(Triangle):
             raise ValueError("LinearTriangle node numbers must be unique inside one triangle.")
         if not isinstance(triangle_number, int) or triangle_number <= 0:
             raise ValueError("LinearTriangle triangle number must be a positive integer.")
+        if not _is_positive_finite_number(meters_per_pixel):
+            raise ValueError("LinearTriangle meters_per_pixel must be a positive finite number.")
 
         signed_area = Triangle.compute_area(coordinates, signed=True)
         if abs(signed_area) <= _AREA_EPSILON:
@@ -50,11 +55,15 @@ class LinearTriangle(Triangle):
         area = super().area()
         if area <= 0.0:
             raise ValueError("LinearTriangle area must be positive.")
+        meters_per_pixel_value = float(meters_per_pixel)
+        physical_area = area * (meters_per_pixel_value ** 2)
         phi_i, phi_j, phi_k = self._compute_basis_coefficients(self.coordinates, area)
 
         object.__setattr__(self, "triangle_number", triangle_number)
         object.__setattr__(self, "node_numbers", numbers)
+        object.__setattr__(self, "meters_per_pixel", meters_per_pixel_value)
         object.__setattr__(self, "area", area)
+        object.__setattr__(self, "physical_area", physical_area)
         object.__setattr__(self, "_phi_i_coeffs", phi_i)
         object.__setattr__(self, "_phi_j_coeffs", phi_j)
         object.__setattr__(self, "_phi_k_coeffs", phi_k)
@@ -74,6 +83,10 @@ class LinearTriangle(Triangle):
     @property
     def area_value(self) -> float:
         return self.area
+
+    @property
+    def physical_area_value(self) -> float:
+        return self.physical_area
 
     def phi_i(self, x: float, y: float) -> float:
         return self._evaluate_linear(self._phi_i_coeffs, x, y)
@@ -126,3 +139,7 @@ def _is_finite_number(value: object) -> bool:
     if not isinstance(value, (int, float)):
         return False
     return isfinite(float(value))
+
+
+def _is_positive_finite_number(value: object) -> bool:
+    return _is_finite_number(value) and float(value) > 0.0

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from dataclasses import replace
 from typing import ClassVar
 
 from PySide6.QtGui import QColor, QImage
@@ -34,6 +35,7 @@ class TriangulationSettings:
     contour_epsilon: float
     max_iterations_factor: int
     min_triangle_quality: float
+    meters_per_pixel: float = 1.0
 
 
 @dataclass(slots=True)
@@ -48,6 +50,8 @@ class TriangulationAdapter:
     MAX_MAX_ITERATIONS_FACTOR: ClassVar[int] = 1000
     MIN_TRIANGLE_QUALITY: ClassVar[float] = 0.0
     MAX_TRIANGLE_QUALITY: ClassVar[float] = 1.0
+    MIN_METERS_PER_PIXEL: ClassVar[float] = 1e-6
+    MAX_METERS_PER_PIXEL: ClassVar[float] = 1e6
 
     threshold: int = 127
     _mesher: AdvancingFrontMesher = field(init=False, repr=False)
@@ -106,7 +110,10 @@ class TriangulationAdapter:
             smoothing_iterations=settings.smoothing_iterations,
         )
         mesh = self._mesher.generate(boundary)
-        mesh = Mesh(triangles=self._obstacle_processor.filter_triangles_by_holes(mesh.triangles, holes))
+        mesh = Mesh(
+            triangles=self._obstacle_processor.filter_triangles_by_holes(mesh.triangles, holes),
+            meters_per_pixel=settings.meters_per_pixel,
+        )
         if not mesh.triangles:
             raise ValueError("Triangulation produced no valid triangles for the selected region.")
         coefficient = mesh_average_quality(mesh)
@@ -136,6 +143,10 @@ class TriangulationAdapter:
         if not self.MIN_TRIANGLE_QUALITY <= settings.min_triangle_quality <= self.MAX_TRIANGLE_QUALITY:
             raise ValueError(
                 f"Min triangle quality must be in [{self.MIN_TRIANGLE_QUALITY}, {self.MAX_TRIANGLE_QUALITY}]."
+            )
+        if not self.MIN_METERS_PER_PIXEL <= settings.meters_per_pixel <= self.MAX_METERS_PER_PIXEL:
+            raise ValueError(
+                f"Meters per pixel must be in [{self.MIN_METERS_PER_PIXEL}, {self.MAX_METERS_PER_PIXEL}]."
             )
 
     def _qimage_to_mask(self, image: QImage) -> Mask:
@@ -220,7 +231,12 @@ class TriangulationAdapter:
                 raise ValueError("Custom mode selected but custom settings are missing.")
             self.validate_custom_settings(custom_settings)
             return custom_settings
-        return self._preset_settings(mode)
+        settings = self._preset_settings(mode)
+        if custom_settings is None:
+            return settings
+        settings = replace(settings, meters_per_pixel=custom_settings.meters_per_pixel)
+        self.validate_custom_settings(settings)
+        return settings
 
     def _preset_settings(self, mode: TriangulationMode) -> TriangulationSettings:
         if mode == TriangulationMode.FAST:
@@ -230,6 +246,7 @@ class TriangulationAdapter:
                 contour_epsilon=3.0,
                 max_iterations_factor=180,
                 min_triangle_quality=0.01,
+                meters_per_pixel=1.0,
             )
         if mode == TriangulationMode.BALANCED:
             return TriangulationSettings(
@@ -238,6 +255,7 @@ class TriangulationAdapter:
                 contour_epsilon=2.0,
                 max_iterations_factor=260,
                 min_triangle_quality=0.01,
+                meters_per_pixel=1.0,
             )
         if mode == TriangulationMode.ACCURATE:
             return TriangulationSettings(
@@ -246,5 +264,6 @@ class TriangulationAdapter:
                 contour_epsilon=1.0,
                 max_iterations_factor=400,
                 min_triangle_quality=0.01,
+                meters_per_pixel=1.0,
             )
         return self._preset_settings(TriangulationMode.BALANCED)
