@@ -1,9 +1,12 @@
 import unittest
 
 import _bootstrap  # noqa: F401
+from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QApplication
 
 from src.presentation.canvas import Canvas
+from src.presentation.tools import Tool
 
 
 class TestCanvasContourIntegration(unittest.TestCase):
@@ -15,11 +18,13 @@ class TestCanvasContourIntegration(unittest.TestCase):
         canvas = Canvas()
         canvas.set_geometry_contours([[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]])
 
-        base, attach_side, anchor = canvas._take_continuation_target(0.2, 0.1)  # noqa: SLF001
+        base, base_index, attach_side, anchor = canvas._take_continuation_target(0.2, 0.1)  # noqa: SLF001
         self.assertEqual(attach_side, "start")
         self.assertEqual(anchor, (0.0, 0.0))
+        self.assertEqual(base_index, 0)
 
         canvas._active_base_contour = base  # noqa: SLF001
+        canvas._active_base_contour_index = base_index  # noqa: SLF001
         canvas._active_attach_side = attach_side  # noqa: SLF001
         canvas._current_stroke = [anchor, (-2.0, 3.0), (-3.0, 8.0)]  # noqa: SLF001
         canvas._maybe_commit_pen_contour()  # noqa: SLF001
@@ -28,11 +33,88 @@ class TestCanvasContourIntegration(unittest.TestCase):
         self.assertEqual(contour[-1], (10.0, 10.0))
         self.assertNotEqual(contour[0], (0.0, 0.0))
 
+    def test_short_pen_continuation_restores_original_open_contour(self) -> None:
+        canvas = Canvas()
+        original = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]
+        canvas.set_geometry_contours([original], preprocess=False, redraw_image=False, emit_change=False)
+
+        base, base_index, attach_side, anchor = canvas._take_continuation_target(10.0, 10.0)  # noqa: SLF001
+        self.assertEqual(canvas.geometry_contours(), [original])
+
+        canvas._active_base_contour = base  # noqa: SLF001
+        canvas._active_base_contour_index = base_index  # noqa: SLF001
+        canvas._active_attach_side = attach_side  # noqa: SLF001
+        canvas._current_stroke = [anchor]  # noqa: SLF001
+        canvas._maybe_commit_pen_contour()  # noqa: SLF001
+
+        self.assertEqual(canvas.geometry_contours(), [original])
+
+    def test_take_continuation_target_does_not_remove_contour_from_cache(self) -> None:
+        canvas = Canvas()
+        original = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]
+        canvas.set_geometry_contours([original], preprocess=False, redraw_image=False, emit_change=False)
+
+        base, base_index, attach_side, anchor = canvas._take_continuation_target(10.0, 10.0)  # noqa: SLF001
+
+        self.assertEqual(base, original)
+        self.assertEqual(base_index, 0)
+        self.assertEqual(attach_side, "end")
+        self.assertEqual(anchor, (10.0, 10.0))
+        self.assertEqual(canvas.geometry_contours(), [original])
+
     def test_invalid_segment_visualization_keeps_only_latest_hint(self) -> None:
         canvas = Canvas()
         canvas.set_invalid_segments([((0.0, 0.0), (1.0, 1.0)), ((2.0, 2.0), (3.0, 3.0))])
 
         self.assertEqual(canvas._invalid_segments, [((2.0, 2.0), (3.0, 3.0))])  # noqa: SLF001
+
+    def test_invalid_point_visualization_replaces_previous_points(self) -> None:
+        canvas = Canvas()
+
+        canvas.set_invalid_points([(10.0, 10.0), (20.0, 30.0)])
+
+        self.assertEqual(canvas._invalid_points, [(10.0, 10.0), (20.0, 30.0)])  # noqa: SLF001
+
+    def test_eraser_marks_geometry_as_dirty_and_clears_cached_contours(self) -> None:
+        canvas = Canvas(width=40, height=40)
+        canvas.set_geometry_contours(
+            [[(5.0, 5.0), (20.0, 5.0), (20.0, 20.0), (5.0, 5.0)]],
+            preprocess=False,
+            redraw_image=False,
+            emit_change=False,
+        )
+        canvas.set_tool(Tool.ERASER)
+
+        press = QMouseEvent(
+            QMouseEvent.Type.MouseButtonPress,
+            QPointF(10.0, 10.0),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        canvas.mousePressEvent(press)
+
+        self.assertTrue(canvas.geometry_is_dirty())
+        self.assertEqual(canvas.geometry_contours(), [])
+
+    def test_segment_tool_preserves_geometry_cache_and_adds_open_segment(self) -> None:
+        canvas = Canvas(width=80, height=80)
+        canvas.set_geometry_contours(
+            [[(5.0, 5.0), (30.0, 5.0), (30.0, 30.0), (5.0, 5.0)]],
+            preprocess=False,
+            redraw_image=False,
+            emit_change=False,
+        )
+        canvas._tool = Tool.SEGMENT  # noqa: SLF001
+        canvas._shape_start = QPoint(40, 40)  # noqa: SLF001
+        canvas._shape_end = QPoint(60, 60)  # noqa: SLF001
+
+        canvas._commit_shape()  # noqa: SLF001
+
+        contours = canvas.geometry_contours()
+        self.assertFalse(canvas.geometry_is_dirty())
+        self.assertEqual(len(contours), 2)
+        self.assertEqual(contours[-1], [(40.0, 40.0), (60.0, 60.0)])
 
     def test_syncing_geometry_contours_without_redraw_preserves_loaded_image(self) -> None:
         canvas = Canvas(width=20, height=20)

@@ -125,9 +125,7 @@ class PaintApp(QMainWindow):
 
     def run_triangulation(self, image_data: QImage) -> tuple[Mesh, float]:
         mode, custom_settings = self._resolve_mode_and_settings()
-        contours = self._canvas.geometry_contours()
-        if not contours:
-            contours = self._refresh_geometry_from_canvas_image(image_data, prefer_strokes=True)
+        contours = self._contours_for_triangulation(image_data, prefer_strokes=True)
         if contours:
             return self._triangulation_adapter.run_from_contours(contours, mode=mode, custom_settings=custom_settings)
         return self._triangulation_adapter.run(image_data, mode=mode, custom_settings=custom_settings)
@@ -850,6 +848,8 @@ class PaintApp(QMainWindow):
             """.replace("__SPINBOX_CONTROLS__", spinbox_controls)
 
     def _set_tool(self, tool: Tool) -> None:
+        if tool in (Tool.PEN, Tool.SEGMENT, Tool.RECTANGLE, Tool.CIRCLE, Tool.POINT) and self._canvas.geometry_is_dirty():
+            self._refresh_geometry_from_canvas_image(self._canvas.image_data(), prefer_strokes=True)
         self._canvas.set_tool(tool)
         self._tool_status_label.setText(f"Tool: {tool.value.capitalize()}")
         action = self._tool_actions.get(tool)
@@ -967,8 +967,18 @@ class PaintApp(QMainWindow):
         if self._triangulation_busy:
             return
         image_data = self._canvas.image_data()
-        drawn_contours = self._canvas.geometry_contours()
-        contours = drawn_contours if drawn_contours else self._refresh_geometry_from_canvas_image(
+        branch_points = self._triangulation_adapter.detect_stroke_branch_points_from_image(image_data)
+        if branch_points:
+            self._canvas.set_invalid_points(branch_points[:12])
+            QMessageBox.warning(
+                self,
+                "Invalid Geometry",
+                "Detected a branch or self-crossing in the drawn stroke. "
+                "Triangulation requires a simple closed boundary without intersections.",
+            )
+            return
+        self._canvas.set_invalid_points([])
+        contours = self._contours_for_triangulation(
             image_data,
             prefer_strokes=True,
         )
@@ -1041,6 +1051,17 @@ class PaintApp(QMainWindow):
             return []
         self._canvas.set_geometry_contours(contours, preprocess=False, redraw_image=False, emit_change=False)
         return self._canvas.geometry_contours()
+
+    def _contours_for_triangulation(
+        self,
+        image_data: QImage,
+        *,
+        prefer_strokes: bool,
+    ) -> list[list[tuple[int, int]]]:
+        contours = self._canvas.geometry_contours()
+        if contours and not self._canvas.geometry_is_dirty():
+            return contours
+        return self._refresh_geometry_from_canvas_image(image_data, prefer_strokes=prefer_strokes)
 
     def _latest_open_segment(
         self,

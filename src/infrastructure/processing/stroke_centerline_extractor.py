@@ -30,6 +30,22 @@ def extract_stroke_centerlines(mask: Mask) -> list[Contour]:
     return contours
 
 
+def detect_stroke_branch_points(mask: Mask) -> list[Pixel]:
+    _validate_mask(mask)
+    skeleton = _zhang_suen_thinning(mask)
+    branch_points: list[Pixel] = []
+    for y in range(1, len(skeleton) - 1):
+        for x in range(1, len(skeleton[0]) - 1):
+            if skeleton[y][x] != 1:
+                continue
+            neighbors = _neighbor_values(skeleton, x, y)
+            if sum(neighbors) < 3:
+                continue
+            if _white_to_black_transitions(neighbors) >= 3:
+                branch_points.append((x, y))
+    return branch_points
+
+
 def _validate_mask(mask: Mask) -> None:
     if not mask or not mask[0]:
         raise ValueError("mask must not be empty")

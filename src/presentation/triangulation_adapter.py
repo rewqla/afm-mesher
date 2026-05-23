@@ -16,7 +16,10 @@ from src.domain.entities.mesh import Mesh
 from src.domain.geometry.geometry_utils import mesh_average_quality
 from src.infrastructure.image.photo_preprocessor import simplify_contour
 from src.infrastructure.processing.image_boundary_extractor import extract_contours
-from src.infrastructure.processing.stroke_centerline_extractor import extract_stroke_centerlines
+from src.infrastructure.processing.stroke_centerline_extractor import (
+    detect_stroke_branch_points,
+    extract_stroke_centerlines,
+)
 from src.presentation.tools import TriangulationMode
 
 
@@ -166,6 +169,10 @@ class TriangulationAdapter:
         if not contours:
             raise ValueError("No stroke geometry found.")
         return contours
+
+    def detect_stroke_branch_points_from_image(self, image_data: QImage) -> list[tuple[int, int]]:
+        mask = self._qimage_to_mask(image_data)
+        return detect_stroke_branch_points(mask)
 
     def _build_polygons(self, contours: list[Contour], epsilon: float) -> list[RegionPolygon]:
         simplified: list[Contour] = []
