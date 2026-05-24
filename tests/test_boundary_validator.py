@@ -50,6 +50,18 @@ class TestBoundaryValidator(unittest.TestCase):
         self.assertTrue(result.is_valid)
         self.assertEqual(normalized[0][0], normalized[0][-1])
 
+    def test_select_outer_contour_ignores_inner_open_cut(self) -> None:
+        outer = [(0, 0), (20, 0), (20, 20), (0, 20), (0, 0)]
+        cut = [(5, 5), (15, 15)]
+
+        selected = self.validator.select_outer_contour([outer, cut])
+        closed = self.validator.normalize_valid_closed_contours([outer, cut])
+
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertEqual(selected[0], selected[-1])
+        self.assertEqual(len(closed), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

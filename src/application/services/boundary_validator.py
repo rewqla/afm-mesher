@@ -94,6 +94,29 @@ class BoundaryValidator:
             normalized.append([(point.x, point.y) for point in processed])
         return normalized
 
+    def normalize_valid_closed_contours(self, contours: list[RawContour]) -> list[RawContour]:
+        normalized: list[RawContour] = []
+        for contour in contours:
+            processed = self._preprocess(contour)
+            result = validate_contour(processed)
+            if result.is_closed and result.is_valid:
+                normalized.append([(point.x, point.y) for point in processed])
+        return normalized
+
+    def select_outer_contour(self, contours: list[RawContour]) -> RawContour | None:
+        closed_contours = self.normalize_valid_closed_contours(contours)
+        if not closed_contours:
+            return None
+        return max(closed_contours, key=lambda contour: abs(self._signed_area(contour)))
+
     def _preprocess(self, contour: RawContour) -> list[Point]:
         points = [Point(float(x), float(y)) for x, y in contour]
         return preprocess_contour(points, epsilon=self._epsilon, closure_tolerance=self._closure_tolerance)
+
+    def _signed_area(self, contour: RawContour) -> float:
+        area = 0.0
+        for idx in range(len(contour) - 1):
+            x1, y1 = contour[idx]
+            x2, y2 = contour[idx + 1]
+            area += x1 * y2 - x2 * y1
+        return area / 2.0

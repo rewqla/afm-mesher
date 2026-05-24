@@ -1,9 +1,18 @@
 import unittest
 
 import _bootstrap  # noqa: F401
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from src.presentation.paint_app import PaintApp, TRIANGULATION_INFO_DIALOG_TEXT
+
+
+class _BranchDetectingAdapter:
+    def __init__(self) -> None:
+        self.branch_detection_calls = 0
+
+    def detect_stroke_branch_points_from_image(self, _image):  # noqa: ANN001
+        self.branch_detection_calls += 1
+        return [(5, 5)]
 
 
 class TestPaintApp(unittest.TestCase):
@@ -43,6 +52,35 @@ class TestPaintApp(unittest.TestCase):
         self.assertIsNotNone(ok_button)
         assert ok_button is not None
         self.assertEqual(ok_button.text(), "Продовжити")
+
+    def test_branch_detection_is_skipped_for_multiple_contours(self) -> None:
+        window = PaintApp()
+        adapter = _BranchDetectingAdapter()
+        window._triangulation_adapter = adapter  # noqa: SLF001
+        window._contours_for_triangulation = lambda *_args, **_kwargs: [  # noqa: SLF001
+            [(0, 0), (20, 0), (20, 20), (0, 20), (0, 0)],
+            [(10, 10), (12, 12)],
+        ]
+        window._boundary_validator.select_outer_contour = lambda _contours: None  # noqa: SLF001
+        open_issue = type(
+            "Issue",
+            (),
+            {"segment": ((10, 10), (12, 12)), "contour_index": 1},
+        )()
+        window._boundary_validator.validate = lambda _contours: type(  # noqa: SLF001
+            "Validation",
+            (),
+            {"is_valid": False, "open_contours": [open_issue], "self_intersections": []},
+        )()
+
+        original_information = QMessageBox.information
+        QMessageBox.information = lambda *_args, **_kwargs: QMessageBox.StandardButton.Ok
+        try:
+            window._on_triangulation()  # noqa: SLF001
+        finally:
+            QMessageBox.information = original_information
+
+        self.assertEqual(adapter.branch_detection_calls, 0)
 
 
 if __name__ == "__main__":

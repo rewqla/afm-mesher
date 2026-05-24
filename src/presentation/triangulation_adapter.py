@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from dataclasses import replace
+from math import hypot
 from typing import ClassVar
 
 from PySide6.QtGui import QColor, QImage
@@ -94,7 +95,8 @@ class TriangulationAdapter:
         raw_contours: list[Contour],
         settings: TriangulationSettings,
     ) -> tuple[Mesh, float]:
-        polygons = self._build_polygons(raw_contours, settings.contour_epsilon)
+        closed_contours, open_contours = self._split_closed_and_open_contours(raw_contours, settings.contour_epsilon)
+        polygons = self._build_polygons(closed_contours, settings.contour_epsilon)
         regions = self._region_classifier.classify(polygons)
         if not regions:
             raise ValueError("No closed contour region found for triangulation.")
@@ -103,17 +105,20 @@ class TriangulationAdapter:
 
         boundary = valid_region.shell.points
         holes = self._obstacle_processor.extract_holes(valid_region)
+        holes = self._obstacle_processor.normalize_holes(valid_region.shell, holes)
+        cuts = self._extract_cuts(open_contours, settings.contour_epsilon)
         self._mesher = AdvancingFrontMesher(
             min_triangle_quality=settings.min_triangle_quality,
             max_iterations_factor=settings.max_iterations_factor,
             target_edge_length=settings.target_edge_length,
             smoothing_iterations=settings.smoothing_iterations,
         )
-        mesh = self._mesher.generate(boundary)
-        mesh = Mesh(
-            triangles=self._obstacle_processor.filter_triangles_by_holes(mesh.triangles, holes),
-            meters_per_pixel=settings.meters_per_pixel,
+        mesh = self._mesher.generate_with_holes_and_cuts(
+            boundary,
+            [hole.points for hole in holes],
+            cuts,
         )
+        mesh = Mesh(triangles=mesh.triangles, meters_per_pixel=settings.meters_per_pixel)
         if not mesh.triangles:
             raise ValueError("Triangulation produced no valid triangles for the selected region.")
         coefficient = mesh_average_quality(mesh)
@@ -195,6 +200,60 @@ class TriangulationAdapter:
                 simplified_contour = [*simplified_contour, simplified_contour[0]]
             simplified.append(simplified_contour)
         return self._boundary_detection.detect(simplified)
+
+    def _split_closed_and_open_contours(
+        self,
+        contours: list[Contour],
+        epsilon: float,
+    ) -> tuple[list[Contour], list[Contour]]:
+        closed_contours: list[Contour] = []
+        open_contours: list[Contour] = []
+
+        for contour in contours:
+            simplified_contour = simplify_contour(contour, epsilon=epsilon)
+            if len(simplified_contour) >= 3 and self._is_closed_contour(contour, simplified_contour, epsilon):
+                closed = simplified_contour
+                if closed[0] != closed[-1]:
+                    closed = [*closed, closed[0]]
+                closed_contours.append(closed)
+            else:
+                open_contours.append(simplified_contour if len(simplified_contour) >= 2 else contour)
+
+        return closed_contours, open_contours
+
+    def _is_closed_contour(self, raw_contour: Contour, simplified_contour: Contour, epsilon: float) -> bool:
+        if len(simplified_contour) >= 3 and simplified_contour[0] == simplified_contour[-1]:
+            return True
+        if len(raw_contour) < 3:
+            return False
+
+        closure_tolerance = max(1.0, epsilon * 2.0)
+        return hypot(
+            float(raw_contour[0][0]) - float(raw_contour[-1][0]),
+            float(raw_contour[0][1]) - float(raw_contour[-1][1]),
+        ) <= closure_tolerance
+
+    def _extract_cuts(self, contours: list[Contour], epsilon: float) -> list[list[Point]]:
+        cuts: list[list[Point]] = []
+        for contour in contours:
+            if len(contour) < 2:
+                continue
+
+            simplified = self._simplify_open_contour(contour, epsilon)
+            if len(simplified) < 2:
+                continue
+            cuts.append([Point(float(x), float(y)) for x, y in simplified])
+        return cuts
+
+    def _simplify_open_contour(self, contour: Contour, epsilon: float) -> Contour:
+        if len(contour) <= 2:
+            return contour
+        simplified = simplify_contour(contour, epsilon=epsilon)
+        if len(simplified) < 2:
+            return contour
+        if simplified[0] == simplified[-1]:
+            return contour
+        return simplified
 
     def _select_valid_region(self, regions: list[ClassifiedRegion]) -> ClassifiedRegion:
         return max(regions, key=lambda region: self._polygon_area(region.shell.points))

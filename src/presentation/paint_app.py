@@ -24,8 +24,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.domain.entities.mesh import Mesh
 from src.application.services.boundary_validator import BoundaryValidator
+from src.domain.entities.mesh import Mesh
 from src.presentation.canvas import Canvas
 from src.presentation.tools import Tool, TriangulationMode
 from src.presentation.triangulation_adapter import TriangulationAdapter, TriangulationSettings
@@ -1011,42 +1011,27 @@ class PaintApp(QMainWindow):
         if self._triangulation_busy:
             return
         image_data = self._canvas.image_data()
-        branch_points = self._triangulation_adapter.detect_stroke_branch_points_from_image(image_data)
-        if branch_points:
-            self._canvas.set_invalid_points(branch_points[:12])
-            QMessageBox.warning(
-                self,
-                "Invalid Geometry",
-                "Detected a branch or self-crossing in the drawn stroke. "
-                "Triangulation requires a simple closed boundary without intersections.",
-            )
-            return
         self._canvas.set_invalid_points([])
         contours = self._contours_for_triangulation(
             image_data,
             prefer_strokes=True,
         )
+        if len(contours) <= 1:
+            branch_points = self._triangulation_adapter.detect_stroke_branch_points_from_image(image_data)
+            if branch_points:
+                self._canvas.set_invalid_points(branch_points[:12])
+                QMessageBox.warning(
+                    self,
+                    "Invalid Geometry",
+                    "Detected a branch or self-crossing in the drawn stroke. "
+                    "Triangulation requires a simple closed boundary without intersections.",
+                )
+                return
         if contours:
-            validation = self._boundary_validator.validate(contours)
-            if not validation.is_valid:
-                self._canvas.set_invalid_segments(self._latest_open_segment(validation))
-                if validation.open_contours:
-                    QMessageBox.information(
-                        self,
-                        "Open Contour Detected",
-                        "Region boundary is not closed. "
-                        "Please close the highlighted gap manually before triangulation.",
-                    )
-                    return
-                if validation.self_intersections:
-                    QMessageBox.warning(
-                        self,
-                        "Invalid Geometry",
-                        "Contour contains self-intersections. Fix geometry before triangulation.",
-                    )
-                    return
-
-            contours = self._boundary_validator.normalize_closed_contours(contours)
+            prepared_contours = self._prepare_contours_for_triangulation(contours)
+            if not prepared_contours:
+                return
+            contours = prepared_contours
         else:
             self._canvas.set_invalid_segments([])
 
@@ -1103,9 +1088,94 @@ class PaintApp(QMainWindow):
         prefer_strokes: bool,
     ) -> list[list[tuple[int, int]]]:
         contours = self._canvas.geometry_contours()
-        if contours and not self._canvas.geometry_is_dirty():
-            return contours
+        cached_closed_contours, cached_open_contours = self._split_closed_and_open_contours(contours)
+        if cached_closed_contours:
+            return [*cached_closed_contours, *cached_open_contours]
+        if prefer_strokes:
+            try:
+                boundary_contours = self._triangulation_adapter.extract_contours_from_image(image_data)
+            except ValueError:
+                boundary_contours = []
+            closed_boundary_contours, open_boundary_contours = self._split_closed_and_open_contours(boundary_contours)
+            if closed_boundary_contours:
+                merged_open_contours = self._merge_unique_contours([*cached_open_contours, *open_boundary_contours])
+                self._canvas.set_geometry_contours(
+                    [*closed_boundary_contours, *merged_open_contours],
+                    preprocess=False,
+                    redraw_image=False,
+                    emit_change=False,
+                )
+                return self._canvas.geometry_contours()
         return self._refresh_geometry_from_canvas_image(image_data, prefer_strokes=prefer_strokes)
+
+    def _merge_unique_contours(
+        self,
+        contours: list[list[tuple[float, float]]],
+    ) -> list[list[tuple[float, float]]]:
+        seen: set[tuple[tuple[float, float], ...]] = set()
+        merged: list[list[tuple[float, float]]] = []
+        for contour in contours:
+            key = tuple((float(x), float(y)) for x, y in contour)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(contour)
+        return merged
+
+    def _split_closed_and_open_contours(
+        self,
+        contours: list[list[tuple[float, float]]],
+    ) -> tuple[list[list[tuple[float, float]]], list[list[tuple[float, float]]]]:
+        closed_contours: list[list[tuple[float, float]]] = []
+        open_contours: list[list[tuple[float, float]]] = []
+        for contour in contours:
+            normalized = self._boundary_validator.normalize_valid_closed_contours([contour])
+            if normalized:
+                closed_contours.append(normalized[0])
+            else:
+                open_contours.append(contour)
+        return closed_contours, open_contours
+
+    def _prepare_contours_for_triangulation(
+        self,
+        contours: list[list[tuple[float, float]]],
+    ) -> list[list[tuple[float, float]]]:
+        closed_contours, open_contours = self._split_closed_and_open_contours(contours)
+        if not closed_contours:
+            if open_contours:
+                QMessageBox.information(
+                    self,
+                    "No Closed Region",
+                    "Triangulation needs at least one closed outer boundary. "
+                    "The open lines will stay available, but the region cannot be triangulated yet.",
+                )
+            return []
+
+        outer_contour = self._boundary_validator.select_outer_contour(closed_contours)
+        if outer_contour is None:
+            validation = self._boundary_validator.validate(closed_contours)
+        else:
+            validation = self._boundary_validator.validate([outer_contour])
+        if not validation.is_valid:
+            self._canvas.set_invalid_segments(self._latest_open_segment(validation))
+            if validation.open_contours:
+                QMessageBox.information(
+                    self,
+                    "Open Contour Detected",
+                    "Region boundary is not closed. "
+                    "Please close the highlighted gap manually before triangulation.",
+                )
+                return []
+            if validation.self_intersections:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Geometry",
+                    "Contour contains self-intersections. Fix geometry before triangulation.",
+                )
+                return []
+
+        closed_contours = self._boundary_validator.normalize_valid_closed_contours(closed_contours)
+        return [*closed_contours, *open_contours]
 
     def _latest_open_segment(
         self,

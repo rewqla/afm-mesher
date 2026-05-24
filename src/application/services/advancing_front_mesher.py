@@ -45,7 +45,20 @@ class AdvancingFrontMesher(IMeshGenerator):
         self._steiner_activation_length_factor = 0.95
 
     def generate(self, boundary: list[Point]) -> Mesh:
+        return self.generate_with_holes(boundary, holes=[])
+
+    def generate_with_holes(self, boundary: list[Point], holes: list[list[Point]]) -> Mesh:
+        return self.generate_with_holes_and_cuts(boundary, holes, cuts=[])
+
+    def generate_with_holes_and_cuts(
+        self,
+        boundary: list[Point],
+        holes: list[list[Point]],
+        cuts: list[list[Point]],
+    ) -> Mesh:
         polygon = self._prepare_boundary(boundary)
+        hole_polygons = [self._prepare_hole_boundary(hole) for hole in holes if hole]
+        cut_polygons = [self._prepare_cut_boundary(cut, polygon) for cut in cuts if len(cut) >= 2]
         base_h = self._resolve_target_step(polygon)
 
         best_mesh: Mesh | None = None
@@ -54,8 +67,8 @@ class AdvancingFrontMesher(IMeshGenerator):
 
         for attempt in range(4):
             target_h = base_h * (0.8 ** attempt)
-            mesh, resampled_boundary = self._generate_single_pass(polygon, target_h)
-            mesh = self.smooth(mesh, boundary=resampled_boundary, iterations=self._smoothing_iterations)
+            mesh, fixed_boundaries = self._generate_single_pass(polygon, hole_polygons, cut_polygons, target_h)
+            mesh = self.smooth(mesh, boundary=fixed_boundaries, iterations=self._smoothing_iterations)
             avg_quality = self._average_mesh_quality(mesh)
 
             if avg_quality > best_quality:
@@ -68,16 +81,28 @@ class AdvancingFrontMesher(IMeshGenerator):
             raise ValueError("AFM failed to generate mesh.")
         return best_mesh
 
-    def _generate_single_pass(self, polygon: list[Point], target_h: float) -> tuple[Mesh, list[Point]]:
+    def _generate_single_pass(
+        self,
+        polygon: list[Point],
+        holes: list[list[Point]],
+        cuts: list[list[Point]],
+        target_h: float,
+    ) -> tuple[Mesh, list[Point]]:
         polygon = self._subdivide_boundary(polygon, target_h)
+        holes = [self._subdivide_boundary(hole, target_h) for hole in holes]
+        cuts = [self._subdivide_boundary(cut, target_h) for cut in cuts]
         front = self._build_initial_front(polygon)
+        for hole in holes:
+            front.extend(self._build_initial_front(hole))
+        for cut in cuts:
+            front.extend(self._build_initial_front(cut))
         triangles: list[Triangle] = []
 
         max_iterations = max(200, len(front) * self._max_iterations_factor)
         iterations = 0
 
         while front and iterations < max_iterations:
-            advancement = self._find_advancement(front, polygon, target_h)
+            advancement = self._find_advancement(front, polygon, holes, cuts, target_h)
             if advancement is None:
                 fallback_triangles = self._fallback_triangulate_front(front)
                 if not fallback_triangles:
@@ -99,7 +124,12 @@ class AdvancingFrontMesher(IMeshGenerator):
         if not triangles:
             raise ValueError("AFM failed to generate mesh.")
 
-        return Mesh(triangles=triangles), polygon
+        fixed_boundary = [*polygon]
+        for hole in holes:
+            fixed_boundary.extend(hole)
+        for cut in cuts:
+            fixed_boundary.extend(cut)
+        return Mesh(triangles=triangles), fixed_boundary
 
     def _prepare_boundary(self, boundary: list[Point]) -> list[Point]:
         if len(boundary) < 3:
@@ -124,6 +154,41 @@ class AdvancingFrontMesher(IMeshGenerator):
             cleaned.reverse()
         return cleaned
 
+    def _prepare_hole_boundary(self, boundary: list[Point]) -> list[Point]:
+        cleaned = self._prepare_boundary(boundary)
+        if self._signed_area(cleaned) > 0:
+            cleaned.reverse()
+        return cleaned
+
+    def _prepare_cut_boundary(self, cut: list[Point], boundary: list[Point]) -> list[Point]:
+        if len(cut) < 2:
+            raise ValueError("Cut must contain at least 2 points.")
+
+        cleaned: list[Point] = []
+        for point in cut:
+            if not cleaned or distance(point, cleaned[-1]) > _EPSILON:
+                cleaned.append(point)
+        if len(cleaned) < 2:
+            raise ValueError("Cut must contain at least 2 distinct points.")
+
+        target_h = self._resolve_target_step(boundary)
+        # Represent a cut as a thin closed barrier so the front grows on both sides of the line.
+        thickness = max(min(target_h * 0.05, 0.75), 0.35)
+        half_thickness = thickness / 2.0
+
+        left_side: list[Point] = []
+        right_side: list[Point] = []
+        for idx, point in enumerate(cleaned):
+            normal = self._cut_vertex_normal(cleaned, idx)
+            left_side.append(Point(point.x + normal.x * half_thickness, point.y + normal.y * half_thickness))
+            right_side.append(Point(point.x - normal.x * half_thickness, point.y - normal.y * half_thickness))
+
+        polygon = [*left_side, *reversed(right_side)]
+        prepared = self._prepare_boundary(polygon)
+        if self._signed_area(prepared) > 0:
+            prepared.reverse()
+        return prepared
+
     def _resolve_target_step(self, boundary: list[Point]) -> float:
         if self._target_edge_length is not None:
             return self._target_edge_length
@@ -133,6 +198,35 @@ class AdvancingFrontMesher(IMeshGenerator):
             perimeter += distance(boundary[i], boundary[(i + 1) % len(boundary)])
         h_avg = perimeter / len(boundary)
         return max(h_avg, 1e-3)
+
+    def _cut_vertex_normal(self, cut: list[Point], index: int) -> Point:
+        if len(cut) == 2:
+            direction = self._unit_direction(cut[0], cut[1])
+            return Point(-direction.y, direction.x)
+
+        if index == 0:
+            direction = self._unit_direction(cut[0], cut[1])
+            return Point(-direction.y, direction.x)
+        if index == len(cut) - 1:
+            direction = self._unit_direction(cut[-2], cut[-1])
+            return Point(-direction.y, direction.x)
+
+        prev_dir = self._unit_direction(cut[index - 1], cut[index])
+        next_dir = self._unit_direction(cut[index], cut[index + 1])
+        nx = -prev_dir.y - next_dir.y
+        ny = prev_dir.x + next_dir.x
+        length = sqrt(nx * nx + ny * ny)
+        if length <= _EPSILON:
+            return Point(-prev_dir.y, prev_dir.x)
+        return Point(nx / length, ny / length)
+
+    def _unit_direction(self, a: Point, b: Point) -> Point:
+        dx = b.x - a.x
+        dy = b.y - a.y
+        length = sqrt(dx * dx + dy * dy)
+        if length <= _EPSILON:
+            return Point(1.0, 0.0)
+        return Point(dx / length, dy / length)
 
     def subdivide_boundary(self, points: list[Point], h: float) -> list[Point]:
         return self._subdivide_boundary(points, h)
@@ -191,12 +285,14 @@ class AdvancingFrontMesher(IMeshGenerator):
         self,
         front: list[FrontEdge],
         polygon: list[Point],
+        holes: list[list[Point]],
+        cuts: list[list[Point]],
         target_step: float,
     ) -> tuple[int, Point, Point, Point] | None:
         for idx in self._sorted_front_indices_by_priority(front):
             a, b = front[idx]
             other_edges = front[:idx] + front[idx + 1:]
-            candidate = self._find_best_node(a, b, polygon, other_edges, target_step)
+            candidate = self._find_best_node(a, b, polygon, holes, cuts, other_edges, target_step)
             if candidate is not None:
                 return idx, a, b, candidate
         return None
@@ -206,6 +302,8 @@ class AdvancingFrontMesher(IMeshGenerator):
         a: Point,
         b: Point,
         polygon: list[Point],
+        holes: list[list[Point]],
+        cuts: list[list[Point]],
         front: list[FrontEdge],
         target_step: float,
     ) -> Point | None:
@@ -221,14 +319,14 @@ class AdvancingFrontMesher(IMeshGenerator):
             for p in self._steiner_candidates(a, b):
                 if self._is_too_close_to_existing_edges(p, front, threshold=0.4 * target_step):
                     continue
-                if self._is_valid_triangle(a, b, p, polygon, front):
+                if self._is_valid_triangle(a, b, p, polygon, holes, cuts, front):
                     return p
 
         # 2) Try to close topology with existing nodes within local radius L.
         near_vertices = [p for p in existing_vertices if distance(p, midpoint) <= edge_len + _EPSILON]
         near_vertices.sort(key=lambda p: distance(p, midpoint))
         for p in near_vertices:
-            if self._is_valid_triangle(a, b, p, polygon, front):
+            if self._is_valid_triangle(a, b, p, polygon, holes, cuts, front):
                 return p
 
         # 3) Wider closure radius for final wave connection.
@@ -236,7 +334,7 @@ class AdvancingFrontMesher(IMeshGenerator):
         far_vertices = [p for p in existing_vertices if distance(p, midpoint) <= closure_radius]
         far_vertices.sort(key=lambda p: distance(p, midpoint))
         for p in far_vertices:
-            if self._is_valid_triangle(a, b, p, polygon, front):
+            if self._is_valid_triangle(a, b, p, polygon, holes, cuts, front):
                 return p
 
         return None
@@ -288,17 +386,21 @@ class AdvancingFrontMesher(IMeshGenerator):
         b: Point,
         c: Point,
         polygon: list[Point],
+        holes: list[list[Point]],
+        cuts: list[list[Point]],
         front: list[FrontEdge],
     ) -> bool:
         if c == a or c == b:
             return False
         if orientation(a, b, c) <= 0:
             return False
-        if not point_in_polygon(c, polygon, include_boundary=True):
+        if not self._point_in_domain(c, polygon, holes, cuts):
             return False
 
         centroid = Point((a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0)
-        if not point_in_polygon(centroid, polygon, include_boundary=True):
+        if not self._point_in_domain(centroid, polygon, holes, cuts):
+            return False
+        if not self._triangle_respects_obstacles(a, b, c, holes, cuts):
             return False
 
         try:
@@ -315,6 +417,55 @@ class AdvancingFrontMesher(IMeshGenerator):
         if self._contains_front_vertex(a, b, c, front):
             return False
         return True
+
+    def _point_in_domain(
+        self,
+        point: Point,
+        polygon: list[Point],
+        holes: list[list[Point]],
+        cuts: list[list[Point]],
+    ) -> bool:
+        if not point_in_polygon(point, polygon, include_boundary=True):
+            return False
+        if any(point_in_polygon(point, hole, include_boundary=False) for hole in holes):
+            return False
+        return not any(point_in_polygon(point, cut, include_boundary=False) for cut in cuts)
+
+    def _triangle_respects_obstacles(
+        self,
+        a: Point,
+        b: Point,
+        c: Point,
+        holes: list[list[Point]],
+        cuts: list[list[Point]],
+    ) -> bool:
+        triangle_edges = ((a, b), (b, c), (c, a))
+        for obstacle in (*holes, *cuts):
+            if any(point_in_polygon(point, obstacle, include_boundary=False) for point in (a, b, c)):
+                return False
+
+            for triangle_edge in triangle_edges:
+                for obstacle_edge in self._polygon_edges(obstacle):
+                    if self._same_edge(triangle_edge, obstacle_edge):
+                        continue
+                    if segments_intersect(
+                        triangle_edge[0],
+                        triangle_edge[1],
+                        obstacle_edge[0],
+                        obstacle_edge[1],
+                        include_endpoints=False,
+                    ):
+                        return False
+
+            for point in obstacle:
+                if point in (a, b, c):
+                    continue
+                if self._point_in_triangle_strict(point, a, b, c):
+                    return False
+        return True
+
+    def _polygon_edges(self, polygon: list[Point]) -> list[FrontEdge]:
+        return [(polygon[i], polygon[(i + 1) % len(polygon)]) for i in range(len(polygon))]
 
     def _edge_intersects_front(self, edge: FrontEdge, front: list[FrontEdge]) -> bool:
         for current in front:
