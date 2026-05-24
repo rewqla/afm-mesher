@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import QWidget
 
 from src.domain.entities.point import Point
@@ -33,6 +33,7 @@ class Canvas(QWidget):
         self._undo_stack: list[QImage] = []
         self._redo_stack: list[QImage] = []
         self._geometry_contours: list[list[tuple[float, float]]] = []
+        self._filled_contour_keys: set[tuple[tuple[float, float], ...]] = set()
         self._invalid_segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
         self._invalid_points: list[tuple[float, float]] = []
         self._current_stroke: list[tuple[float, float]] = []
@@ -60,6 +61,7 @@ class Canvas(QWidget):
         self._push_undo_state()
         self._image.fill(Qt.GlobalColor.white)
         self._geometry_contours.clear()
+        self._filled_contour_keys.clear()
         self._invalid_segments.clear()
         self._invalid_points.clear()
         self._geometry_dirty = False
@@ -73,6 +75,7 @@ class Canvas(QWidget):
         converted = image.convertToFormat(QImage.Format.Format_RGB32)
         self._image = converted
         self._geometry_contours.clear()
+        self._filled_contour_keys.clear()
         self._invalid_segments.clear()
         self._invalid_points.clear()
         self._geometry_dirty = False
@@ -143,6 +146,7 @@ class Canvas(QWidget):
         emit_change: bool = True,
     ) -> None:
         self._geometry_contours = []
+        self._filled_contour_keys.clear()
         for contour in contours:
             self._store_contour(contour, preprocess=preprocess)
         self._geometry_dirty = False
@@ -171,6 +175,7 @@ class Canvas(QWidget):
         self._redo_stack.append(self._image.copy())
         self._image = self._undo_stack.pop()
         self._geometry_contours.clear()
+        self._filled_contour_keys.clear()
         self._invalid_segments.clear()
         self._invalid_points.clear()
         self._geometry_dirty = True
@@ -185,6 +190,7 @@ class Canvas(QWidget):
         self._undo_stack.append(self._image.copy())
         self._image = self._redo_stack.pop()
         self._geometry_contours.clear()
+        self._filled_contour_keys.clear()
         self._invalid_segments.clear()
         self._invalid_points.clear()
         self._geometry_dirty = True
@@ -224,10 +230,12 @@ class Canvas(QWidget):
                     self._last_point = QPoint(int(round(sx)), int(round(sy)))
             else:
                 self._geometry_contours.clear()
+                self._filled_contour_keys.clear()
                 self._geometry_dirty = True
         elif self._tool == Tool.FILL:
             self._push_undo_state()
             self._geometry_contours.clear()
+            self._filled_contour_keys.clear()
             self._geometry_dirty = True
             self._flood_fill(point)
             self.image_changed.emit()
@@ -340,6 +348,7 @@ class Canvas(QWidget):
                 (rect.left(), rect.top()),
             ]
             self._geometry_contours.append(contour)
+            self._filled_contour_keys.add(self._contour_key(contour))
             self._geometry_dirty = False
         elif self._tool == Tool.CIRCLE:
             rect = QRect(self._shape_start, self._shape_end).normalized()
@@ -468,7 +477,8 @@ class Canvas(QWidget):
                 closure_tolerance=self._closure_tolerance,
             )
         if self._active_base_contour_index is not None:
-            self._geometry_contours.pop(self._active_base_contour_index)
+            removed = self._geometry_contours.pop(self._active_base_contour_index)
+            self._filled_contour_keys.discard(self._contour_key(removed))
         self._store_contour([(point.x, point.y) for point in contour_points])
         self._redraw_geometry_layer()
         self._geometry_dirty = False
@@ -488,6 +498,7 @@ class Canvas(QWidget):
             contour.append((x, y))
         contour.append(contour[0])
         self._store_contour(contour)
+        self._filled_contour_keys.add(self._contour_key(self._geometry_contours[-1]))
         self._geometry_dirty = False
 
     def _append_ellipse_contour(self, rect: QRect, segments: int = 40) -> None:
@@ -505,6 +516,7 @@ class Canvas(QWidget):
             contour.append((x, y))
         contour.append(contour[0])
         self._store_contour(contour)
+        self._filled_contour_keys.add(self._contour_key(self._geometry_contours[-1]))
         self._geometry_dirty = False
 
     def _redraw_geometry_layer(self) -> None:
@@ -512,10 +524,18 @@ class Canvas(QWidget):
         painter = QPainter(self._image)
         pen = QPen(Qt.GlobalColor.black, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
         for contour in self._geometry_contours:
             if len(contour) < 2:
                 continue
+            if self._contour_is_closed(contour) and self._contour_key(contour) in self._filled_contour_keys:
+                painter.setBrush(Qt.GlobalColor.black)
+                polygon_points = [
+                    QPoint(int(round(x)), int(round(y)))
+                    for x, y in contour
+                ]
+                painter.drawPolygon(QPolygon(polygon_points))
+                continue
+            painter.setBrush(Qt.BrushStyle.NoBrush)
             for i in range(len(contour) - 1):
                 x1, y1 = contour[i]
                 x2, y2 = contour[i + 1]
@@ -573,6 +593,9 @@ class Canvas(QWidget):
         if len(processed) < 2:
             return
         self._geometry_contours.append([(point.x, point.y) for point in processed])
+
+    def _contour_key(self, contour: list[tuple[float, float]]) -> tuple[tuple[float, float], ...]:
+        return tuple((round(float(x), 3), round(float(y), 3)) for x, y in contour)
 
     def _contour_is_closed(self, contour: list[tuple[float, float]]) -> bool:
         if len(contour) < 4:

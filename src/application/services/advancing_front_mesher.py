@@ -16,9 +16,11 @@ from src.domain.interfaces.imesh_generator import IMeshGenerator
 
 FrontEdge = tuple[Point, Point]
 TriangleIds = tuple[int, int, int]
+Segment = tuple[Point, Point]
 
 _EPSILON = 1e-9
 _KEY_PRECISION = 10
+_MAX_EAR_DIAGONAL_FACTOR = 2.4
 
 
 class AdvancingFrontMesher(IMeshGenerator):
@@ -47,8 +49,13 @@ class AdvancingFrontMesher(IMeshGenerator):
     def generate(self, boundary: list[Point]) -> Mesh:
         return self.generate_with_holes(boundary, holes=[])
 
-    def generate_with_holes(self, boundary: list[Point], holes: list[list[Point]]) -> Mesh:
-        return self.generate_with_holes_and_cuts(boundary, holes, cuts=[])
+    def generate_with_holes(
+        self,
+        boundary: list[Point],
+        holes: list[list[Point]],
+        cuts: list[list[Point]] | None = None,
+    ) -> Mesh:
+        return self.generate_with_holes_and_cuts(boundary, holes, cuts=cuts or [])
 
     def generate_with_holes_and_cuts(
         self,
@@ -58,7 +65,7 @@ class AdvancingFrontMesher(IMeshGenerator):
     ) -> Mesh:
         polygon = self._prepare_boundary(boundary)
         hole_polygons = [self._prepare_hole_boundary(hole) for hole in holes if hole]
-        cut_polygons = [self._prepare_cut_boundary(cut, polygon) for cut in cuts if len(cut) >= 2]
+        cut_segments = self._prepare_cuts(cuts, polygon, hole_polygons, tolerance=max(_EPSILON * 100.0, 1e-6))
         base_h = self._resolve_target_step(polygon)
 
         best_mesh: Mesh | None = None
@@ -67,8 +74,14 @@ class AdvancingFrontMesher(IMeshGenerator):
 
         for attempt in range(4):
             target_h = base_h * (0.8 ** attempt)
-            mesh, fixed_boundaries = self._generate_single_pass(polygon, hole_polygons, cut_polygons, target_h)
+            mesh, fixed_boundaries, pass_cut_segments = self._generate_single_pass(
+                polygon,
+                hole_polygons,
+                cut_segments,
+                target_h,
+            )
             mesh = self.smooth(mesh, boundary=fixed_boundaries, iterations=self._smoothing_iterations)
+            self._validate_cut_segments_are_mesh_edges(mesh, pass_cut_segments)
             avg_quality = self._average_mesh_quality(mesh)
 
             if avg_quality > best_quality:
@@ -85,26 +98,27 @@ class AdvancingFrontMesher(IMeshGenerator):
         self,
         polygon: list[Point],
         holes: list[list[Point]],
-        cuts: list[list[Point]],
+        cut_segments: list[Segment],
         target_h: float,
-    ) -> tuple[Mesh, list[Point]]:
+    ) -> tuple[Mesh, list[Point], list[Segment]]:
         polygon = self._subdivide_boundary(polygon, target_h)
         holes = [self._subdivide_boundary(hole, target_h) for hole in holes]
-        cuts = [self._subdivide_boundary(cut, target_h) for cut in cuts]
+        pass_cut_segments = self._subdivide_cut_segments(cut_segments, target_h)
         front = self._build_initial_front(polygon)
         for hole in holes:
             front.extend(self._build_initial_front(hole))
-        for cut in cuts:
-            front.extend(self._build_initial_front(cut))
+        for a, b in pass_cut_segments:
+            front.append((a, b))
+            front.append((b, a))
         triangles: list[Triangle] = []
 
         max_iterations = max(200, len(front) * self._max_iterations_factor)
         iterations = 0
 
         while front and iterations < max_iterations:
-            advancement = self._find_advancement(front, polygon, holes, cuts, target_h)
+            advancement = self._find_advancement(front, polygon, holes, pass_cut_segments, target_h)
             if advancement is None:
-                fallback_triangles = self._fallback_triangulate_front(front)
+                fallback_triangles = self._fallback_triangulate_front(front, polygon, holes, pass_cut_segments)
                 if not fallback_triangles:
                     raise ValueError("AFM stalled: active front cannot be advanced further.")
                 triangles.extend(fallback_triangles)
@@ -127,9 +141,10 @@ class AdvancingFrontMesher(IMeshGenerator):
         fixed_boundary = [*polygon]
         for hole in holes:
             fixed_boundary.extend(hole)
-        for cut in cuts:
-            fixed_boundary.extend(cut)
-        return Mesh(triangles=triangles), fixed_boundary
+        for a, b in pass_cut_segments:
+            fixed_boundary.append(a)
+            fixed_boundary.append(b)
+        return Mesh(triangles=triangles), fixed_boundary, pass_cut_segments
 
     def _prepare_boundary(self, boundary: list[Point]) -> list[Point]:
         if len(boundary) < 3:
@@ -160,34 +175,36 @@ class AdvancingFrontMesher(IMeshGenerator):
             cleaned.reverse()
         return cleaned
 
-    def _prepare_cut_boundary(self, cut: list[Point], boundary: list[Point]) -> list[Point]:
-        if len(cut) < 2:
-            raise ValueError("Cut must contain at least 2 points.")
+    def _prepare_cuts(
+        self,
+        cuts: list[list[Point]],
+        boundary: list[Point],
+        holes: list[list[Point]],
+        tolerance: float,
+    ) -> list[Segment]:
+        domain_vertices = [*boundary]
+        for hole in holes:
+            domain_vertices.extend(hole)
 
-        cleaned: list[Point] = []
-        for point in cut:
-            if not cleaned or distance(point, cleaned[-1]) > _EPSILON:
-                cleaned.append(point)
-        if len(cleaned) < 2:
-            raise ValueError("Cut must contain at least 2 distinct points.")
+        normalized: list[list[Point]] = []
+        for cut in cuts:
+            cleaned = self._normalize_cut_polyline(cut, tolerance)
+            if len(cleaned) < 2:
+                continue
+            snapped = [self._snap_point_to_vertices(p, domain_vertices, tolerance) for p in cleaned]
+            self._validate_cut_polyline(snapped, boundary, holes, tolerance)
+            normalized.append(snapped)
 
-        target_h = self._resolve_target_step(boundary)
-        # Represent a cut as a thin closed barrier so the front grows on both sides of the line.
-        thickness = max(min(target_h * 0.05, 0.75), 0.35)
-        half_thickness = thickness / 2.0
+        segments: list[Segment] = []
+        for cut in normalized:
+            for i in range(len(cut) - 1):
+                a = cut[i]
+                b = cut[i + 1]
+                if distance(a, b) <= tolerance:
+                    continue
+                segments.append((a, b))
 
-        left_side: list[Point] = []
-        right_side: list[Point] = []
-        for idx, point in enumerate(cleaned):
-            normal = self._cut_vertex_normal(cleaned, idx)
-            left_side.append(Point(point.x + normal.x * half_thickness, point.y + normal.y * half_thickness))
-            right_side.append(Point(point.x - normal.x * half_thickness, point.y - normal.y * half_thickness))
-
-        polygon = [*left_side, *reversed(right_side)]
-        prepared = self._prepare_boundary(polygon)
-        if self._signed_area(prepared) > 0:
-            prepared.reverse()
-        return prepared
+        return self._split_cut_segments(segments, tolerance)
 
     def _resolve_target_step(self, boundary: list[Point]) -> float:
         if self._target_edge_length is not None:
@@ -286,13 +303,13 @@ class AdvancingFrontMesher(IMeshGenerator):
         front: list[FrontEdge],
         polygon: list[Point],
         holes: list[list[Point]],
-        cuts: list[list[Point]],
+        cut_segments: list[Segment],
         target_step: float,
     ) -> tuple[int, Point, Point, Point] | None:
         for idx in self._sorted_front_indices_by_priority(front):
             a, b = front[idx]
             other_edges = front[:idx] + front[idx + 1:]
-            candidate = self._find_best_node(a, b, polygon, holes, cuts, other_edges, target_step)
+            candidate = self._find_best_node(a, b, polygon, holes, cut_segments, other_edges, target_step)
             if candidate is not None:
                 return idx, a, b, candidate
         return None
@@ -303,7 +320,7 @@ class AdvancingFrontMesher(IMeshGenerator):
         b: Point,
         polygon: list[Point],
         holes: list[list[Point]],
-        cuts: list[list[Point]],
+        cut_segments: list[Segment],
         front: list[FrontEdge],
         target_step: float,
     ) -> Point | None:
@@ -319,14 +336,16 @@ class AdvancingFrontMesher(IMeshGenerator):
             for p in self._steiner_candidates(a, b):
                 if self._is_too_close_to_existing_edges(p, front, threshold=0.4 * target_step):
                     continue
-                if self._is_valid_triangle(a, b, p, polygon, holes, cuts, front):
+                if self._is_valid_triangle(a, b, p, polygon, holes, cut_segments, front):
                     return p
 
         # 2) Try to close topology with existing nodes within local radius L.
         near_vertices = [p for p in existing_vertices if distance(p, midpoint) <= edge_len + _EPSILON]
         near_vertices.sort(key=lambda p: distance(p, midpoint))
         for p in near_vertices:
-            if self._is_valid_triangle(a, b, p, polygon, holes, cuts, front):
+            if not self._is_reasonable_closure_candidate(a, b, p, edge_len, max_ratio=1.8):
+                continue
+            if self._is_valid_triangle(a, b, p, polygon, holes, cut_segments, front):
                 return p
 
         # 3) Wider closure radius for final wave connection.
@@ -334,7 +353,9 @@ class AdvancingFrontMesher(IMeshGenerator):
         far_vertices = [p for p in existing_vertices if distance(p, midpoint) <= closure_radius]
         far_vertices.sort(key=lambda p: distance(p, midpoint))
         for p in far_vertices:
-            if self._is_valid_triangle(a, b, p, polygon, holes, cuts, front):
+            if not self._is_reasonable_closure_candidate(a, b, p, edge_len, max_ratio=2.2):
+                continue
+            if self._is_valid_triangle(a, b, p, polygon, holes, cut_segments, front):
                 return p
 
         return None
@@ -387,20 +408,22 @@ class AdvancingFrontMesher(IMeshGenerator):
         c: Point,
         polygon: list[Point],
         holes: list[list[Point]],
-        cuts: list[list[Point]],
+        cut_segments: list[Segment],
         front: list[FrontEdge],
     ) -> bool:
         if c == a or c == b:
             return False
         if orientation(a, b, c) <= 0:
             return False
-        if not self._point_in_domain(c, polygon, holes, cuts):
+        if not self._point_in_domain(c, polygon, holes):
             return False
 
         centroid = Point((a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0)
-        if not self._point_in_domain(centroid, polygon, holes, cuts):
+        if not self._point_in_domain(centroid, polygon, holes):
             return False
-        if not self._triangle_respects_obstacles(a, b, c, holes, cuts):
+        if not self._triangle_respects_holes(a, b, c, holes):
+            return False
+        if not self._triangle_respects_cut_segments(a, b, c, cut_segments):
             return False
 
         try:
@@ -423,24 +446,22 @@ class AdvancingFrontMesher(IMeshGenerator):
         point: Point,
         polygon: list[Point],
         holes: list[list[Point]],
-        cuts: list[list[Point]],
     ) -> bool:
         if not point_in_polygon(point, polygon, include_boundary=True):
             return False
         if any(point_in_polygon(point, hole, include_boundary=False) for hole in holes):
             return False
-        return not any(point_in_polygon(point, cut, include_boundary=False) for cut in cuts)
+        return True
 
-    def _triangle_respects_obstacles(
+    def _triangle_respects_holes(
         self,
         a: Point,
         b: Point,
         c: Point,
         holes: list[list[Point]],
-        cuts: list[list[Point]],
     ) -> bool:
         triangle_edges = ((a, b), (b, c), (c, a))
-        for obstacle in (*holes, *cuts):
+        for obstacle in holes:
             if any(point_in_polygon(point, obstacle, include_boundary=False) for point in (a, b, c)):
                 return False
 
@@ -461,6 +482,16 @@ class AdvancingFrontMesher(IMeshGenerator):
                 if point in (a, b, c):
                     continue
                 if self._point_in_triangle_strict(point, a, b, c):
+                    return False
+        return True
+
+    def _triangle_respects_cut_segments(self, a: Point, b: Point, c: Point, cut_segments: list[Segment]) -> bool:
+        triangle_edges = ((a, b), (b, c), (c, a))
+        for edge in triangle_edges:
+            for cut_segment in cut_segments:
+                if self._same_undirected_edge(edge, cut_segment):
+                    continue
+                if segments_intersect(edge[0], edge[1], cut_segment[0], cut_segment[1], include_endpoints=False):
                     return False
         return True
 
@@ -500,6 +531,9 @@ class AdvancingFrontMesher(IMeshGenerator):
 
     def _same_edge(self, e1: FrontEdge, e2: FrontEdge) -> bool:
         return distance(e1[0], e2[0]) <= _EPSILON and distance(e1[1], e2[1]) <= _EPSILON
+
+    def _same_undirected_edge(self, e1: FrontEdge, e2: FrontEdge) -> bool:
+        return self._same_edge(e1, e2) or self._same_edge(e1, (e2[1], e2[0]))
 
     def _share_endpoint(self, e1: FrontEdge, e2: FrontEdge) -> bool:
         return e1[0] == e2[0] or e1[0] == e2[1] or e1[1] == e2[0] or e1[1] == e2[1]
@@ -546,11 +580,17 @@ class AdvancingFrontMesher(IMeshGenerator):
         qualities = [triangle_quality(t.a, t.b, t.c) for t in mesh.triangles]
         return sum(qualities) / len(qualities)
 
-    def _fallback_triangulate_front(self, front: list[FrontEdge]) -> list[Triangle]:
+    def _fallback_triangulate_front(
+        self,
+        front: list[FrontEdge],
+        polygon: list[Point],
+        holes: list[list[Point]],
+        cut_segments: list[Segment],
+    ) -> list[Triangle]:
         loop = self._order_front_loop(front)
         if loop is None or len(loop) < 3:
             return []
-        return self._ear_clip_polygon(loop)
+        return self._ear_clip_polygon(loop, polygon, holes, cut_segments)
 
     def _order_front_loop(self, front: list[FrontEdge]) -> list[Point] | None:
         if not front:
@@ -584,7 +624,13 @@ class AdvancingFrontMesher(IMeshGenerator):
 
         return loop if len(loop) >= 3 else None
 
-    def _ear_clip_polygon(self, polygon: list[Point]) -> list[Triangle]:
+    def _ear_clip_polygon(
+        self,
+        polygon: list[Point],
+        domain_polygon: list[Point],
+        holes: list[list[Point]],
+        cut_segments: list[Segment],
+    ) -> list[Triangle]:
         points = polygon.copy()
         triangles: list[Triangle] = []
 
@@ -603,6 +649,14 @@ class AdvancingFrontMesher(IMeshGenerator):
                 if orientation(a, b, c) <= 0:
                     continue
                 if triangle_quality(a, b, c) < self._min_triangle_quality:
+                    continue
+                if not self._ear_has_reasonable_diagonal(a, b, c):
+                    continue
+                if not self._point_in_domain(Point((a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0), domain_polygon, holes):
+                    continue
+                if not self._triangle_respects_holes(a, b, c, holes):
+                    continue
+                if not self._triangle_respects_cut_segments(a, b, c, cut_segments):
                     continue
 
                 contains_point = False
@@ -625,8 +679,38 @@ class AdvancingFrontMesher(IMeshGenerator):
             guard += 1
 
         if len(points) == 3:
-            triangles.append(Triangle(points[0], points[1], points[2]))
+            a, b, c = points[0], points[1], points[2]
+            if (
+                orientation(a, b, c) > 0
+                and self._ear_has_reasonable_diagonal(a, b, c)
+                and self._point_in_domain(Point((a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0), domain_polygon, holes)
+                and self._triangle_respects_holes(a, b, c, holes)
+                and self._triangle_respects_cut_segments(a, b, c, cut_segments)
+            ):
+                triangles.append(Triangle(a, b, c))
         return triangles
+
+    def _is_reasonable_closure_candidate(
+        self,
+        a: Point,
+        b: Point,
+        candidate: Point,
+        base_len: float,
+        max_ratio: float,
+    ) -> bool:
+        if base_len <= _EPSILON:
+            return False
+        ac = distance(a, candidate)
+        bc = distance(b, candidate)
+        limit = base_len * max_ratio
+        return ac <= limit and bc <= limit
+
+    def _ear_has_reasonable_diagonal(self, a: Point, b: Point, c: Point) -> bool:
+        ab = distance(a, b)
+        bc = distance(b, c)
+        ac = distance(a, c)
+        local_scale = max(ab, bc, _EPSILON)
+        return ac <= local_scale * _MAX_EAR_DIAGONAL_FACTOR
 
     def _point_in_triangle_strict(self, p: Point, a: Point, b: Point, c: Point) -> bool:
         o1 = orientation(a, b, p)
@@ -711,6 +795,175 @@ class AdvancingFrontMesher(IMeshGenerator):
 
     def _point_key(self, point: Point) -> tuple[float, float]:
         return (round(point.x, _KEY_PRECISION), round(point.y, _KEY_PRECISION))
+
+    def _normalize_cut_polyline(self, cut: list[Point], tolerance: float) -> list[Point]:
+        if len(cut) < 2:
+            return []
+        cleaned: list[Point] = []
+        for point in cut:
+            if not cleaned or distance(cleaned[-1], point) > tolerance:
+                cleaned.append(point)
+        return cleaned if len(cleaned) >= 2 else []
+
+    def _snap_point_to_vertices(self, point: Point, vertices: list[Point], tolerance: float) -> Point:
+        for vertex in vertices:
+            if distance(point, vertex) <= tolerance:
+                return vertex
+        return point
+
+    def _validate_cut_polyline(
+        self,
+        cut: list[Point],
+        boundary: list[Point],
+        holes: list[list[Point]],
+        tolerance: float,
+    ) -> None:
+        if len(cut) < 2:
+            raise ValueError("Cut must contain at least 2 points.")
+
+        for i in range(len(cut) - 1):
+            a = cut[i]
+            b = cut[i + 1]
+            if distance(a, b) <= tolerance:
+                raise ValueError("Cut contains too short segment.")
+            midpoint = Point((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)
+            if not point_in_polygon(midpoint, boundary, include_boundary=True):
+                raise ValueError("Cut segment lies outside boundary.")
+            if any(point_in_polygon(midpoint, hole, include_boundary=True) for hole in holes):
+                raise ValueError("Cut intersects hole interior.")
+            for hole in holes:
+                for edge in self._polygon_edges(hole):
+                    if segments_intersect(a, b, edge[0], edge[1], include_endpoints=True):
+                        raise ValueError("Cut intersects or touches hole boundary.")
+
+        self._ensure_cut_no_self_intersection(cut)
+
+    def _ensure_cut_no_self_intersection(self, cut: list[Point]) -> None:
+        edges = [(cut[i], cut[i + 1]) for i in range(len(cut) - 1)]
+        for i, first in enumerate(edges):
+            for j in range(i + 1, len(edges)):
+                if abs(i - j) <= 1:
+                    continue
+                second = edges[j]
+                if segments_intersect(first[0], first[1], second[0], second[1], include_endpoints=True):
+                    raise ValueError("Cut self-intersection is not allowed.")
+
+    def _split_cut_segments(self, segments: list[Segment], tolerance: float) -> list[Segment]:
+        if not segments:
+            return []
+
+        changed = True
+        current = segments.copy()
+        while changed:
+            changed = False
+            next_segments: list[Segment] = []
+            used = [False] * len(current)
+            for i, first in enumerate(current):
+                if used[i]:
+                    continue
+                split_points_first: list[Point] = [first[0], first[1]]
+                for j in range(i + 1, len(current)):
+                    second = current[j]
+                    intersection = self._segment_intersection_point(first[0], first[1], second[0], second[1], tolerance)
+                    if intersection is None:
+                        continue
+                    if not self._point_is_endpoint(intersection, first, tolerance):
+                        split_points_first.append(intersection)
+                        changed = True
+                    if not self._point_is_endpoint(intersection, second, tolerance):
+                        used[j] = True
+                        split_points_second = [second[0], intersection, second[1]]
+                        next_segments.extend(self._segments_from_points(split_points_second, tolerance))
+                        changed = True
+                next_segments.extend(self._segments_from_points(split_points_first, tolerance))
+            current = self._dedupe_segments(next_segments, tolerance)
+        return current
+
+    def _segment_intersection_point(
+        self,
+        a: Point,
+        b: Point,
+        c: Point,
+        d: Point,
+        tolerance: float,
+    ) -> Point | None:
+        if not segments_intersect(a, b, c, d, include_endpoints=True):
+            return None
+
+        denominator = (a.x - b.x) * (c.y - d.y) - (a.y - b.y) * (c.x - d.x)
+        if abs(denominator) <= tolerance:
+            if self._share_endpoint((a, b), (c, d)):
+                for point in (a, b):
+                    if distance(point, c) <= tolerance or distance(point, d) <= tolerance:
+                        return point
+            raise ValueError("Overlapping collinear cut segments are not supported.")
+
+        det1 = a.x * b.y - a.y * b.x
+        det2 = c.x * d.y - c.y * d.x
+        x = (det1 * (c.x - d.x) - (a.x - b.x) * det2) / denominator
+        y = (det1 * (c.y - d.y) - (a.y - b.y) * det2) / denominator
+        return Point(x, y)
+
+    def _point_is_endpoint(self, point: Point, segment: Segment, tolerance: float) -> bool:
+        return distance(point, segment[0]) <= tolerance or distance(point, segment[1]) <= tolerance
+
+    def _segments_from_points(self, points: list[Point], tolerance: float) -> list[Segment]:
+        unique: list[Point] = []
+        for point in points:
+            if not unique or distance(unique[-1], point) > tolerance:
+                unique.append(point)
+        output: list[Segment] = []
+        for i in range(len(unique) - 1):
+            if distance(unique[i], unique[i + 1]) > tolerance:
+                output.append((unique[i], unique[i + 1]))
+        return output
+
+    def _dedupe_segments(self, segments: list[Segment], tolerance: float) -> list[Segment]:
+        deduped: list[Segment] = []
+        for segment in segments:
+            if distance(segment[0], segment[1]) <= tolerance:
+                continue
+            if any(self._same_undirected_edge(segment, existing) for existing in deduped):
+                continue
+            deduped.append(segment)
+        return deduped
+
+    def _validate_cut_segments_are_mesh_edges(self, mesh: Mesh, cut_segments: list[Segment]) -> None:
+        if not cut_segments:
+            return
+        mesh_edges = {
+            self._undirected_edge_key(edge)
+            for triangle in mesh.triangles
+            for edge in ((triangle.a, triangle.b), (triangle.b, triangle.c), (triangle.c, triangle.a))
+        }
+        for segment in cut_segments:
+            if self._undirected_edge_key(segment) not in mesh_edges:
+                raise ValueError("AFM failed to preserve all constrained cut segments in the mesh.")
+
+    def _undirected_edge_key(self, edge: Segment) -> tuple[tuple[float, float], tuple[float, float]]:
+        a, b = edge
+        return tuple(sorted((self._point_key(a), self._point_key(b))))
+
+    def _subdivide_cut_segments(self, cut_segments: list[Segment], h: float) -> list[Segment]:
+        if not cut_segments:
+            return []
+        subdivided: list[Segment] = []
+        for a, b in cut_segments:
+            seg_len = distance(a, b)
+            if seg_len <= _EPSILON:
+                continue
+            k = max(1, ceil(seg_len / h))
+            prev = a
+            for j in range(1, k + 1):
+                t = j / k
+                curr = Point(
+                    a.x + (b.x - a.x) * t,
+                    a.y + (b.y - a.y) * t,
+                )
+                if distance(prev, curr) > _EPSILON:
+                    subdivided.append((prev, curr))
+                prev = curr
+        return self._dedupe_segments(subdivided, tolerance=max(_EPSILON * 100.0, 1e-6))
 
     def _signed_area(self, polygon: list[Point]) -> float:
         area = 0.0

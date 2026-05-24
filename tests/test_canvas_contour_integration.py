@@ -2,7 +2,7 @@ import unittest
 
 import _bootstrap  # noqa: F401
 from PySide6.QtCore import QPoint, QPointF, Qt
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtGui import QColor, QMouseEvent
 from PySide6.QtWidgets import QApplication
 
 from src.presentation.canvas import Canvas
@@ -115,6 +115,42 @@ class TestCanvasContourIntegration(unittest.TestCase):
         self.assertFalse(canvas.geometry_is_dirty())
         self.assertEqual(len(contours), 2)
         self.assertEqual(contours[-1], [(40.0, 40.0), (60.0, 60.0)])
+
+    def test_filled_rectangle_fill_persists_after_pen_commit_redraw(self) -> None:
+        canvas = Canvas(width=120, height=120)
+        canvas._tool = Tool.RECTANGLE  # noqa: SLF001
+        canvas._shape_start = QPoint(20, 20)  # noqa: SLF001
+        canvas._shape_end = QPoint(80, 80)  # noqa: SLF001
+        canvas._commit_shape()  # noqa: SLF001
+
+        before = canvas.image_data().pixelColor(50, 50)
+        self.assertEqual(before, QColor(Qt.GlobalColor.black))
+
+        canvas._tool = Tool.PEN  # noqa: SLF001
+        canvas._current_stroke = [  # noqa: SLF001
+            (10.0, 10.0),
+            (15.0, 12.0),
+            (18.0, 15.0),
+            (22.0, 20.0),
+        ]
+        canvas._maybe_commit_pen_contour()  # noqa: SLF001
+
+        after = canvas.image_data().pixelColor(50, 50)
+        self.assertEqual(after, QColor(Qt.GlobalColor.black))
+
+    def test_closed_pen_contour_is_not_auto_filled_after_redraw(self) -> None:
+        canvas = Canvas(width=120, height=120)
+        closed_pen_contour = [
+            (20.0, 20.0),
+            (80.0, 20.0),
+            (80.0, 80.0),
+            (20.0, 80.0),
+            (20.0, 20.0),
+        ]
+        canvas.set_geometry_contours([closed_pen_contour], preprocess=False, redraw_image=True, emit_change=False)
+
+        center = canvas.image_data().pixelColor(50, 50)
+        self.assertEqual(center, QColor(Qt.GlobalColor.white))
 
     def test_syncing_geometry_contours_without_redraw_preserves_loaded_image(self) -> None:
         canvas = Canvas(width=20, height=20)
