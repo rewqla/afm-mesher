@@ -179,6 +179,36 @@ class TestCanvasContourIntegration(unittest.TestCase):
         after = canvas.image_data().pixelColor(50, 50)
         self.assertEqual(after, QColor(Qt.GlobalColor.black))
 
+    def test_dirty_cache_then_shape_then_pen_keeps_raster_content(self) -> None:
+        canvas = Canvas(width=140, height=140)
+        canvas.set_tool(Tool.RECTANGLE)
+        canvas._shape_start = QPoint(20, 20)  # noqa: SLF001
+        canvas._shape_end = QPoint(100, 100)  # noqa: SLF001
+        canvas._commit_shape()  # noqa: SLF001
+
+        # Dirty cache emulates raster edits after triangulation/fill.
+        canvas._geometry_dirty = True  # noqa: SLF001
+        canvas.set_tool(Tool.CIRCLE)
+        canvas._shape_start = QPoint(30, 30)  # noqa: SLF001
+        canvas._shape_end = QPoint(60, 60)  # noqa: SLF001
+        canvas._commit_shape()  # noqa: SLF001
+        self.assertTrue(canvas.geometry_is_dirty())
+
+        before = canvas.image_data().pixelColor(50, 50)
+        self.assertEqual(before, QColor(Qt.GlobalColor.black))
+
+        canvas._tool = Tool.PEN  # noqa: SLF001
+        canvas._current_stroke = [  # noqa: SLF001
+            (5.0, 5.0),
+            (9.0, 8.0),
+            (13.0, 11.0),
+            (17.0, 14.0),
+        ]
+        canvas._maybe_commit_pen_contour()  # noqa: SLF001
+
+        after = canvas.image_data().pixelColor(50, 50)
+        self.assertEqual(after, QColor(Qt.GlobalColor.black))
+
     def test_syncing_geometry_contours_without_redraw_preserves_loaded_image(self) -> None:
         canvas = Canvas(width=20, height=20)
         original = canvas.image_data()

@@ -310,17 +310,19 @@ class Canvas(QWidget):
         return QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
 
     def _draw_point(self, point: QPoint) -> None:
+        was_dirty = self._geometry_dirty
         painter = QPainter(self._image)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(Qt.GlobalColor.black)
         painter.drawEllipse(point, 4, 4)
         painter.end()
-        self._append_circle_contour(point, 4)
-        self._geometry_dirty = False
+        self._append_circle_contour(point, 4, preserve_dirty=was_dirty)
+        self._geometry_dirty = was_dirty
 
     def _commit_shape(self) -> None:
         if self._shape_start is None or self._shape_end is None:
             return
+        was_dirty = self._geometry_dirty
 
         painter = QPainter(self._image)
         pen = QPen(Qt.GlobalColor.black, 2, Qt.PenStyle.SolidLine)
@@ -336,7 +338,7 @@ class Canvas(QWidget):
                 ],
                 preprocess=False,
             )
-            self._geometry_dirty = False
+            self._geometry_dirty = was_dirty
         elif self._tool == Tool.RECTANGLE:
             rect = QRect(self._shape_start, self._shape_end).normalized()
             painter.drawRect(rect)
@@ -349,12 +351,12 @@ class Canvas(QWidget):
             ]
             self._geometry_contours.append(contour)
             self._filled_contour_keys.add(self._contour_key(contour))
-            self._geometry_dirty = False
+            self._geometry_dirty = was_dirty
         elif self._tool == Tool.CIRCLE:
             rect = QRect(self._shape_start, self._shape_end).normalized()
             painter.drawEllipse(rect)
-            self._append_ellipse_contour(rect)
-            self._geometry_dirty = False
+            self._append_ellipse_contour(rect, preserve_dirty=was_dirty)
+            self._geometry_dirty = was_dirty
         painter.end()
 
     def _draw_shape_preview(self, painter: QPainter) -> None:
@@ -492,7 +494,14 @@ class Canvas(QWidget):
         self._active_base_contour_index = None
         self._active_attach_side = "end"
 
-    def _append_circle_contour(self, center: QPoint, radius: int, segments: int = 20) -> None:
+    def _append_circle_contour(
+        self,
+        center: QPoint,
+        radius: int,
+        segments: int = 20,
+        *,
+        preserve_dirty: bool = False,
+    ) -> None:
         from math import cos, pi, sin
 
         contour: list[tuple[int, int]] = []
@@ -504,9 +513,9 @@ class Canvas(QWidget):
         contour.append(contour[0])
         self._store_contour(contour)
         self._filled_contour_keys.add(self._contour_key(self._geometry_contours[-1]))
-        self._geometry_dirty = False
+        self._geometry_dirty = preserve_dirty
 
-    def _append_ellipse_contour(self, rect: QRect, segments: int = 40) -> None:
+    def _append_ellipse_contour(self, rect: QRect, segments: int = 40, *, preserve_dirty: bool = False) -> None:
         from math import cos, pi, sin
 
         cx = rect.center().x()
@@ -522,7 +531,7 @@ class Canvas(QWidget):
         contour.append(contour[0])
         self._store_contour(contour)
         self._filled_contour_keys.add(self._contour_key(self._geometry_contours[-1]))
-        self._geometry_dirty = False
+        self._geometry_dirty = preserve_dirty
 
     def _redraw_geometry_layer(self) -> None:
         self._image.fill(Qt.GlobalColor.white)
