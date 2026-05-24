@@ -480,8 +480,13 @@ class Canvas(QWidget):
             removed = self._geometry_contours.pop(self._active_base_contour_index)
             self._filled_contour_keys.discard(self._contour_key(removed))
         self._store_contour([(point.x, point.y) for point in contour_points])
-        self._redraw_geometry_layer()
-        self._geometry_dirty = False
+        # If geometry cache is marked dirty (e.g. after flood fill / raster edits),
+        # do not rebuild the full raster from contour cache, otherwise valid pixels disappear.
+        if self._geometry_dirty:
+            self._geometry_dirty = True
+        else:
+            self._redraw_geometry_layer()
+            self._geometry_dirty = False
         self._current_stroke = []
         self._active_base_contour = None
         self._active_base_contour_index = None

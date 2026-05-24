@@ -152,6 +152,33 @@ class TestCanvasContourIntegration(unittest.TestCase):
         center = canvas.image_data().pixelColor(50, 50)
         self.assertEqual(center, QColor(Qt.GlobalColor.white))
 
+    def test_fill_then_pen_keeps_existing_raster_content(self) -> None:
+        canvas = Canvas(width=120, height=120)
+        canvas.set_tool(Tool.RECTANGLE)
+        canvas._shape_start = QPoint(15, 15)  # noqa: SLF001
+        canvas._shape_end = QPoint(95, 95)  # noqa: SLF001
+        canvas._commit_shape()  # noqa: SLF001
+
+        # Simulate a flood-fill workflow: raster is updated while geometry cache becomes dirty.
+        canvas._geometry_contours.clear()  # noqa: SLF001
+        canvas._filled_contour_keys.clear()  # noqa: SLF001
+        canvas._geometry_dirty = True  # noqa: SLF001
+
+        before = canvas.image_data().pixelColor(50, 50)
+        self.assertEqual(before, QColor(Qt.GlobalColor.black))
+
+        canvas._tool = Tool.PEN  # noqa: SLF001
+        canvas._current_stroke = [  # noqa: SLF001
+            (5.0, 5.0),
+            (8.0, 7.0),
+            (12.0, 10.0),
+            (16.0, 14.0),
+        ]
+        canvas._maybe_commit_pen_contour()  # noqa: SLF001
+
+        after = canvas.image_data().pixelColor(50, 50)
+        self.assertEqual(after, QColor(Qt.GlobalColor.black))
+
     def test_syncing_geometry_contours_without_redraw_preserves_loaded_image(self) -> None:
         canvas = Canvas(width=20, height=20)
         original = canvas.image_data()
