@@ -41,6 +41,106 @@ TRIANGULATION_INFO_DIALOG_TEXT = (
     "• Під час тріангуляції такий розріз обходиться з обох сторін. Тобто він працює як межа, "
     "у якої є дві окремі сторони."
 )
+TRIANGULATION_INFO_DIALOG_TEXT_EN = (
+    "Pay attention to inclusions and cuts before starting triangulation:\n\n"
+    "1. Inclusion (closed regions inside the main domain):\n"
+    "- During triangulation of the main domain, an inclusion may be ignored.\n"
+    "- If inclusion is handled, the mesh is built separately for the main domain and inclusion. "
+    "Triangles do not overlap across their shared boundary. Boundary nodes can have separate "
+    "indices for each region.\n\n"
+    "2. Cut (a line inside the domain):\n"
+    "- During triangulation, this cut is processed from both sides, so it acts like a boundary "
+    "with two distinct sides."
+)
+
+TRANSLATIONS: dict[str, dict[str, str]] = {
+    "uk": {
+        "window_title": "AFM Редактор Маски",
+        "status_ready": "Готово",
+        "status_idle": "Очікування",
+        "status_tri_in_progress": "Тріангуляція виконується...",
+        "status_tri_failed": "Тріангуляція не вдалась",
+        "tool_prefix": "Інструмент: {tool}",
+        "mode_prefix": "Тріангуляція: {mode}",
+        "mode_fast": "Швидкий",
+        "mode_balanced": "Збалансований",
+        "mode_accurate": "Точний",
+        "mode_custom": "Користувацький",
+        "properties": "Властивості",
+        "theme": "Тема:",
+        "theme_dark": "Темна",
+        "theme_light": "Світла",
+        "language": "Мова:",
+        "language_uk": "Українська",
+        "language_en": "English",
+        "canvas_size": "Розмір Полотна",
+        "preset": "Пресет:",
+        "custom": "Користувацький",
+        "width": "Ширина:",
+        "height": "Висота:",
+        "use_custom_values": "Використовувати користувацькі значення",
+        "tri_settings": "Параметри Тріангуляції",
+        "target_edge_length": "Цільова довжина ребра (h):",
+        "smoothing_iterations": "Ітерації згладжування:",
+        "contour_simplify_epsilon": "Епсілон спрощення контуру:",
+        "max_iterations_factor": "Коефіцієнт макс. ітерацій:",
+        "min_triangle_quality": "Мін. якість трикутника:",
+        "scale_m_per_px": "Масштаб (м/пкс):",
+        "status_tri_done": "Тріангуляцію завершено. коефіцієнт={coefficient:.4f}",
+        "tool_pen": "Перо",
+        "tool_eraser": "Ластик",
+        "tool_fill": "Заливка",
+        "tool_point": "Точка",
+        "tool_segment": "Відрізок",
+        "tool_rectangle": "Прямокутник",
+        "tool_circle": "Коло",
+        "tri_info_title": "Інформація про тріангуляцію",
+        "continue": "Продовжити",
+    },
+    "en": {
+        "window_title": "AFM Mask Editor",
+        "status_ready": "Ready",
+        "status_idle": "Idle",
+        "status_tri_in_progress": "Triangulation in progress...",
+        "status_tri_failed": "Triangulation failed",
+        "tool_prefix": "Tool: {tool}",
+        "mode_prefix": "Triangulation: {mode}",
+        "mode_fast": "Fast",
+        "mode_balanced": "Balanced",
+        "mode_accurate": "Accurate",
+        "mode_custom": "Custom",
+        "properties": "Properties",
+        "theme": "Theme:",
+        "theme_dark": "Dark",
+        "theme_light": "Light",
+        "language": "Language:",
+        "language_uk": "Ukrainian",
+        "language_en": "English",
+        "canvas_size": "Canvas Size",
+        "preset": "Preset:",
+        "custom": "Custom",
+        "width": "Width:",
+        "height": "Height:",
+        "use_custom_values": "Use custom values",
+        "tri_settings": "Triangulation Settings",
+        "target_edge_length": "Target edge length (h):",
+        "smoothing_iterations": "Smoothing iterations:",
+        "contour_simplify_epsilon": "Contour simplify epsilon:",
+        "max_iterations_factor": "Max iterations factor:",
+        "min_triangle_quality": "Min triangle quality:",
+        "scale_m_per_px": "Scale (m/px):",
+        "status_tri_done": "Triangulation done. coefficient={coefficient:.4f}",
+        "tool_pen": "Pen",
+        "tool_eraser": "Eraser",
+        "tool_fill": "Fill",
+        "tool_point": "Point",
+        "tool_segment": "Segment",
+        "tool_rectangle": "Rectangle",
+        "tool_circle": "Circle",
+        "tri_info_title": "Triangulation Info",
+        "continue": "Continue",
+    },
+}
 
 
 class TriangulationWorker(QObject):
@@ -93,6 +193,7 @@ class PaintApp(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
+        self._language = "uk"
         self.setWindowTitle("AFM Mask Editor")
         self._canvas = Canvas()
         self._triangulation_adapter = TriangulationAdapter()
@@ -106,6 +207,7 @@ class PaintApp(QMainWindow):
         self._triangulation_worker: TriangulationWorker | None = None
         self._triangulation_busy = False
         self._triangulation_mode = TriangulationMode.BALANCED
+        self._current_tool = Tool.PEN
         self._tool_status_label = QLabel("Tool: Pen")
         self._state_status_label = QLabel("Idle")
         self._mode_status_label = QLabel("Triangulation: Balanced")
@@ -114,10 +216,12 @@ class PaintApp(QMainWindow):
 
         self._mode_combo: QComboBox
         self._theme_combo: QComboBox
+        self._language_combo: QComboBox
         self._size_preset_combo: QComboBox
         self._canvas_width_spin: QSpinBox
         self._canvas_height_spin: QSpinBox
         self._canvas_size_feedback: QLabel
+        self._canvas_limits_label: QLabel
         self._custom_checkbox: QCheckBox
         self._h_spin: QDoubleSpinBox
         self._smooth_spin: QSpinBox
@@ -125,15 +229,21 @@ class PaintApp(QMainWindow):
         self._iter_factor_spin: QSpinBox
         self._quality_spin: QDoubleSpinBox
         self._meters_per_pixel_spin: QDoubleSpinBox
+        self._settings_layout: QFormLayout
+        self._size_form: QFormLayout
+        self._manual_form: QFormLayout
+        self._size_group: QGroupBox
+        self._manual_group: QGroupBox
 
         self._build_central_workspace()
         self._build_toolbar()
         self._build_settings_panel()
         self._configure_status_bar()
+        self._apply_initial_language()
         self._apply_theme(self._theme_combo.currentData())
         self._apply_preset_controls(self._triangulation_mode)
         self._update_custom_controls_enabled()
-        self.statusBar().showMessage("Ready")
+        self.statusBar().showMessage(self._t("status_ready"))
         self.resize(1200, 780)
 
     def run_triangulation(self, image_data: QImage) -> tuple[Mesh, float]:
@@ -145,8 +255,101 @@ class PaintApp(QMainWindow):
 
     def display_triangulation_result(self, mesh: Mesh, coefficient: float) -> None:
         self._canvas.set_mesh_overlay(mesh)
-        self.statusBar().showMessage(f"Triangulation done. coefficient={coefficient:.4f}")
-        self._state_status_label.setText("Idle")
+        self.statusBar().showMessage(self._t("status_tri_done").format(coefficient=coefficient))
+        self._state_status_label.setText(self._t("status_idle"))
+
+    def _t(self, key: str) -> str:
+        return TRANSLATIONS[self._language].get(key, key)
+
+    def _apply_initial_language(self) -> None:
+        env_lang = os.getenv("AFM_LANG", "uk").strip().lower()
+        self._language = "en" if env_lang.startswith("en") else "uk"
+        self._language_combo.setCurrentIndex(1 if self._language == "en" else 0)
+        self._retranslate_ui()
+
+    def _retranslate_ui(self) -> None:
+        self.setWindowTitle(self._t("window_title"))
+        if self._settings_dock is not None:
+            self._settings_dock.setWindowTitle(self._t("properties"))
+        self._size_group.setTitle(self._t("canvas_size"))
+        self._manual_group.setTitle(self._t("tri_settings"))
+        self._theme_combo.setItemText(0, self._t("theme_dark"))
+        self._theme_combo.setItemText(1, self._t("theme_light"))
+        self._language_combo.setItemText(0, self._t("language_uk"))
+        self._language_combo.setItemText(1, self._t("language_en"))
+        self._mode_combo.setItemText(0, self._t("mode_fast"))
+        self._mode_combo.setItemText(1, self._t("mode_balanced"))
+        self._mode_combo.setItemText(2, self._t("mode_accurate"))
+        self._mode_combo.setItemText(3, self._t("mode_custom"))
+        self._size_preset_combo.setItemText(self._size_preset_combo.count() - 1, self._t("custom"))
+        self._custom_checkbox.setText(self._t("use_custom_values"))
+        theme_label = self._settings_layout.labelForField(self._theme_combo)
+        if theme_label is not None:
+            theme_label.setText(self._t("theme"))
+        language_label = self._settings_layout.labelForField(self._language_combo)
+        if language_label is not None:
+            language_label.setText(self._t("language"))
+        mode_label = self._settings_layout.labelForField(self._mode_combo)
+        if mode_label is not None:
+            mode_label.setText(self._t("preset"))
+        size_preset_label = self._size_form.labelForField(self._size_preset_combo)
+        if size_preset_label is not None:
+            size_preset_label.setText(self._t("preset"))
+        width_label = self._size_form.labelForField(self._canvas_width_spin)
+        if width_label is not None:
+            width_label.setText(self._t("width"))
+        height_label = self._size_form.labelForField(self._canvas_height_spin)
+        if height_label is not None:
+            height_label.setText(self._t("height"))
+        h_label = self._manual_form.labelForField(self._h_spin)
+        if h_label is not None:
+            h_label.setText(self._t("target_edge_length"))
+        smooth_label = self._manual_form.labelForField(self._smooth_spin)
+        if smooth_label is not None:
+            smooth_label.setText(self._t("smoothing_iterations"))
+        eps_label = self._manual_form.labelForField(self._epsilon_spin)
+        if eps_label is not None:
+            eps_label.setText(self._t("contour_simplify_epsilon"))
+        iter_label = self._manual_form.labelForField(self._iter_factor_spin)
+        if iter_label is not None:
+            iter_label.setText(self._t("max_iterations_factor"))
+        quality_label = self._manual_form.labelForField(self._quality_spin)
+        if quality_label is not None:
+            quality_label.setText(self._t("min_triangle_quality"))
+        scale_label = self._manual_form.labelForField(self._meters_per_pixel_spin)
+        if scale_label is not None:
+            scale_label.setText(self._t("scale_m_per_px"))
+        for key, action in self._actions.items():
+            action.setText(self._localized_action_title(key))
+        self._set_tool(self._current_tool)
+        self._set_triangulation_mode(self._triangulation_mode)
+        if not self._triangulation_busy:
+            self._state_status_label.setText(self._t("status_idle"))
+            self.statusBar().showMessage(self._t("status_ready"))
+
+    def _localized_action_title(self, key: str) -> str:
+        if self._language == "en":
+            return key
+        mapping = {
+            "Pen": "Перо",
+            "Eraser": "Ластик",
+            "Fill": "Заливка",
+            "Point": "Точка",
+            "Segment": "Відрізок",
+            "Rectangle": "Прямокутник",
+            "Circle": "Коло",
+            "Undo": "Скасувати",
+            "Redo": "Повернути",
+            "Save": "Зберегти",
+            "Load": "Завантажити",
+            "Info": "Інфо",
+            "Triangulation": "Тріангуляція",
+            "Clear": "Очистити",
+        }
+        return mapping.get(key, key)
+
+    def _localized_tool_name(self, tool: Tool) -> str:
+        return self._t(f"tool_{tool.value}")
 
     def _build_toolbar(self) -> None:
         tools_toolbar = QToolBar("Drawing Tools", self)
@@ -227,6 +430,7 @@ class PaintApp(QMainWindow):
         panel = QWidget()
         panel.setObjectName("PropertiesPanel")
         layout = QFormLayout(panel)
+        self._settings_layout = layout
         layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
         self._theme_combo = QComboBox()
@@ -237,8 +441,16 @@ class PaintApp(QMainWindow):
         self._theme_combo.currentIndexChanged.connect(self._on_theme_changed)
         layout.addRow("Theme:", self._theme_combo)
 
+        self._language_combo = QComboBox()
+        self._language_combo.addItem("Українська", "uk")
+        self._language_combo.addItem("English", "en")
+        self._language_combo.currentIndexChanged.connect(self._on_language_changed)
+        layout.addRow("Language:", self._language_combo)
+
         size_group = QGroupBox("Canvas Size")
+        self._size_group = size_group
         size_form = QFormLayout(size_group)
+        self._size_form = size_form
 
         self._size_preset_combo = QComboBox()
         for label, size in self._CANVAS_SIZE_PRESETS:
@@ -271,6 +483,7 @@ class PaintApp(QMainWindow):
             f"Allowed range: {Canvas.MIN_WIDTH}-{Canvas.MAX_WIDTH}px width, "
             f"{Canvas.MIN_HEIGHT}-{Canvas.MAX_HEIGHT}px height."
         )
+        self._canvas_limits_label = limits_label
         limits_label.setWordWrap(True)
         size_form.addRow("", limits_label)
 
@@ -295,7 +508,9 @@ class PaintApp(QMainWindow):
         layout.addRow("", self._custom_checkbox)
 
         manual_group = QGroupBox("Triangulation Settings")
+        self._manual_group = manual_group
         manual_form = QFormLayout(manual_group)
+        self._manual_form = manual_form
 
         self._h_spin = QDoubleSpinBox()
         self._h_spin.setRange(
@@ -420,6 +635,11 @@ class PaintApp(QMainWindow):
 
     def _on_theme_changed(self) -> None:
         self._apply_theme(str(self._theme_combo.currentData()))
+
+    def _on_language_changed(self) -> None:
+        language = str(self._language_combo.currentData())
+        self._language = "en" if language == "en" else "uk"
+        self._retranslate_ui()
 
     def _current_canvas_dimensions(self) -> tuple[int, int]:
         size = self._canvas.canvas_size()
@@ -878,14 +1098,16 @@ class PaintApp(QMainWindow):
         if tool in (Tool.PEN, Tool.SEGMENT, Tool.RECTANGLE, Tool.CIRCLE, Tool.POINT) and self._canvas.geometry_is_dirty():
             self._refresh_geometry_from_canvas_image(self._canvas.image_data(), prefer_strokes=True)
         self._canvas.set_tool(tool)
-        self._tool_status_label.setText(f"Tool: {tool.value.capitalize()}")
+        self._current_tool = tool
+        self._tool_status_label.setText(self._t("tool_prefix").format(tool=self._localized_tool_name(tool)))
         action = self._tool_actions.get(tool)
         if action is not None and not action.isChecked():
             action.setChecked(True)
 
     def _set_triangulation_mode(self, mode: TriangulationMode) -> None:
         self._triangulation_mode = mode
-        self._mode_status_label.setText(f"Triangulation: {mode.value.capitalize()}")
+        mode_key = f"mode_{mode.value}"
+        self._mode_status_label.setText(self._t("mode_prefix").format(mode=self._t(mode_key)))
 
     def _on_mode_combo_changed(self) -> None:
         mode = TriangulationMode(self._mode_combo.currentData())
@@ -948,14 +1170,14 @@ class PaintApp(QMainWindow):
 
     def _build_triangulation_info_dialog(self) -> QMessageBox:
         dialog = QMessageBox(self)
-        dialog.setWindowTitle("Triangulation Info")
+        dialog.setWindowTitle(self._t("tri_info_title"))
         dialog.setIcon(QMessageBox.Icon.Information)
         dialog.setTextFormat(Qt.TextFormat.PlainText)
-        dialog.setText(TRIANGULATION_INFO_DIALOG_TEXT)
+        dialog.setText(TRIANGULATION_INFO_DIALOG_TEXT_EN if self._language == "en" else TRIANGULATION_INFO_DIALOG_TEXT)
         dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
         ok_button = dialog.button(QMessageBox.StandardButton.Ok)
         if ok_button is not None:
-            ok_button.setText("Продовжити")
+            ok_button.setText(self._t("continue"))
         return dialog
 
     def show_triangulation_info_dialog(self) -> None:
@@ -1043,8 +1265,8 @@ class PaintApp(QMainWindow):
                 QMessageBox.warning(self, "Invalid Parameters", str(error))
                 return
         self._set_triangulation_busy(True)
-        self.statusBar().showMessage("Triangulation in progress...")
-        self._state_status_label.setText("Triangulating...")
+        self.statusBar().showMessage(self._t("status_tri_in_progress"))
+        self._state_status_label.setText(self._t("status_tri_in_progress"))
 
         self._triangulation_thread = QThread(self)
         self._triangulation_worker = TriangulationWorker(
@@ -1194,8 +1416,8 @@ class PaintApp(QMainWindow):
     def _on_triangulation_failed(self, message: str) -> None:
         self._set_triangulation_busy(False)
         QMessageBox.warning(self, "Triangulation Error", message)
-        self.statusBar().showMessage("Triangulation failed")
-        self._state_status_label.setText("Idle")
+        self.statusBar().showMessage(self._t("status_tri_failed"))
+        self._state_status_label.setText(self._t("status_idle"))
 
     def _cleanup_triangulation_thread(self) -> None:
         if self._triangulation_thread is not None:

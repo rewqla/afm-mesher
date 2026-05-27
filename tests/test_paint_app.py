@@ -31,7 +31,10 @@ class TestPaintApp(unittest.TestCase):
 
     def test_resolve_custom_settings_includes_meters_per_pixel(self) -> None:
         window = PaintApp()
-        window._mode_combo.setCurrentText("Custom")  # noqa: SLF001
+        for index in range(window._mode_combo.count()):  # noqa: SLF001
+            if window._mode_combo.itemData(index) == "custom":  # noqa: SLF001
+                window._mode_combo.setCurrentIndex(index)  # noqa: SLF001
+                break
         window._meters_per_pixel_spin.setValue(0.01)  # noqa: SLF001
 
         mode, settings = window._resolve_mode_and_settings()  # noqa: SLF001
@@ -46,7 +49,7 @@ class TestPaintApp(unittest.TestCase):
 
         dialog = window._build_triangulation_info_dialog()  # noqa: SLF001
 
-        self.assertEqual(dialog.windowTitle(), "Triangulation Info")
+        self.assertEqual(dialog.windowTitle(), "Інформація про тріангуляцію")
         self.assertEqual(dialog.text(), TRIANGULATION_INFO_DIALOG_TEXT)
         ok_button = dialog.button(dialog.StandardButton.Ok)
         self.assertIsNotNone(ok_button)
