@@ -259,6 +259,101 @@ class TestLoadedImageValidationPipeline(unittest.TestCase):
         self.assertEqual(len(boundary), 4)
         self.assertEqual(len(holes), 2)
 
+    def test_adapter_collects_nested_inner_polygons_as_obstacles(self) -> None:
+        outer = [(0, 0), (40, 0), (40, 40), (0, 40), (0, 0)]
+        hole_like = [(8, 8), (32, 8), (32, 32), (8, 32), (8, 8)]
+        island_like = [(14, 14), (26, 14), (26, 26), (14, 26), (14, 14)]
+
+        mesh = Mesh(triangles=[Triangle(Point(0, 0), Point(1, 0), Point(0, 1))])
+        with patch("src.application.services.advancing_front_mesher.AdvancingFrontMesher.generate_with_holes_and_cuts") as generate:
+            generate.return_value = mesh
+
+            result_mesh, coefficient = self.adapter.run_from_contours([outer, hole_like, island_like])
+
+        self.assertEqual(result_mesh.triangles, mesh.triangles)
+        self.assertGreaterEqual(coefficient, 0.0)
+        boundary, holes, _ = generate.call_args.args[-3:]
+        self.assertEqual(len(boundary), 4)
+        self.assertGreaterEqual(len(holes), 1)
+
+    def test_adapter_merges_touching_holes_chain_into_single_obstacle(self) -> None:
+        outer = [(0, 0), (60, 0), (60, 40), (0, 40), (0, 0)]
+        h1 = [(8, 10), (18, 10), (18, 20), (8, 20), (8, 10)]
+        h2 = [(18, 10), (28, 10), (28, 20), (18, 20), (18, 10)]
+        h3 = [(28, 10), (38, 10), (38, 20), (28, 20), (28, 10)]
+
+        mesh = Mesh(triangles=[Triangle(Point(0, 0), Point(1, 0), Point(0, 1))])
+        with patch("src.application.services.advancing_front_mesher.AdvancingFrontMesher.generate_with_holes_and_cuts") as generate:
+            generate.return_value = mesh
+
+            self.adapter.run_from_contours([outer, h1, h2, h3])
+
+        _, holes, _ = generate.call_args.args[-3:]
+        self.assertEqual(len(holes), 1)
+
+    def test_adapter_preserves_two_separate_hole_clusters(self) -> None:
+        outer = [(0, 0), (80, 0), (80, 50), (0, 50), (0, 0)]
+        # cluster A (touching)
+        a1 = [(8, 8), (16, 8), (16, 16), (8, 16), (8, 8)]
+        a2 = [(16, 8), (24, 8), (24, 16), (16, 16), (16, 8)]
+        # cluster B (overlapping)
+        b1 = [(50, 20), (60, 20), (60, 30), (50, 30), (50, 20)]
+        b2 = [(56, 24), (66, 24), (66, 34), (56, 34), (56, 24)]
+
+        mesh = Mesh(triangles=[Triangle(Point(0, 0), Point(1, 0), Point(0, 1))])
+        with patch("src.application.services.advancing_front_mesher.AdvancingFrontMesher.generate_with_holes_and_cuts") as generate:
+            generate.return_value = mesh
+
+            self.adapter.run_from_contours([outer, a1, a2, b1, b2])
+
+        _, holes, _ = generate.call_args.args[-3:]
+        self.assertEqual(len(holes), 2)
+
+    def test_adapter_merges_f_like_obstacle_from_multiple_rectangles(self) -> None:
+        outer = [(0, 0), (120, 0), (120, 120), (0, 120), (0, 0)]
+        vertical = [(30, 20), (50, 20), (50, 100), (30, 100), (30, 20)]
+        top_bar = [(30, 80), (90, 80), (90, 100), (30, 100), (30, 80)]
+        mid_bar = [(30, 50), (75, 50), (75, 65), (30, 65), (30, 50)]
+        left_stub = [(20, 60), (30, 60), (30, 75), (20, 75), (20, 60)]
+
+        mesh = Mesh(triangles=[Triangle(Point(0, 0), Point(1, 0), Point(0, 1))])
+        with patch("src.application.services.advancing_front_mesher.AdvancingFrontMesher.generate_with_holes_and_cuts") as generate:
+            generate.return_value = mesh
+
+            self.adapter.run_from_contours([outer, vertical, top_bar, mid_bar, left_stub])
+
+        _, holes, _ = generate.call_args.args[-3:]
+        self.assertEqual(len(holes), 1)
+
+    def test_adapter_merges_corner_touching_holes_into_single_obstacle(self) -> None:
+        outer = [(0, 0), (50, 0), (50, 50), (0, 50), (0, 0)]
+        h1 = [(10, 10), (20, 10), (20, 20), (10, 20), (10, 10)]
+        h2 = [(20, 20), (30, 20), (30, 30), (20, 30), (20, 20)]
+
+        mesh = Mesh(triangles=[Triangle(Point(0, 0), Point(1, 0), Point(0, 1))])
+        with patch("src.application.services.advancing_front_mesher.AdvancingFrontMesher.generate_with_holes_and_cuts") as generate:
+            generate.return_value = mesh
+
+            self.adapter.run_from_contours([outer, h1, h2])
+
+        _, holes, _ = generate.call_args.args[-3:]
+        self.assertEqual(len(holes), 1)
+
+    def test_adapter_ignores_obstacle_outside_selected_shell(self) -> None:
+        outer = [(0, 0), (40, 0), (40, 40), (0, 40), (0, 0)]
+        inner = [(10, 10), (20, 10), (20, 20), (10, 20), (10, 10)]
+        outside = [(55, 55), (65, 55), (65, 65), (55, 65), (55, 55)]
+
+        mesh = Mesh(triangles=[Triangle(Point(0, 0), Point(1, 0), Point(0, 1))])
+        with patch("src.application.services.advancing_front_mesher.AdvancingFrontMesher.generate_with_holes_and_cuts") as generate:
+            generate.return_value = mesh
+
+            self.adapter.run_from_contours([outer, inner, outside])
+
+        boundary, holes, _ = generate.call_args.args[-3:]
+        self.assertEqual(len(boundary), 4)
+        self.assertEqual(len(holes), 1)
+
     def test_adapter_routes_open_segment_into_cuts(self) -> None:
         outer = [(0, 0), (30, 0), (30, 30), (0, 30), (0, 0)]
         cut = [(5, 15), (25, 15)]

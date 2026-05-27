@@ -15,7 +15,7 @@ from src.application.services.region_classifier import RegionClassifier
 from src.application.services.region_topology import ClassifiedRegion, RegionPolygon
 from src.domain.entities.point import Point
 from src.domain.entities.mesh import Mesh
-from src.domain.geometry.geometry_utils import mesh_average_quality
+from src.domain.geometry.geometry_utils import mesh_average_quality, point_in_polygon
 from src.infrastructure.image.photo_preprocessor import simplify_contour
 from src.infrastructure.processing.image_boundary_extractor import extract_contours
 from src.infrastructure.processing.stroke_centerline_extractor import (
@@ -104,7 +104,7 @@ class TriangulationAdapter:
         self._build_topology_graph(valid_region)
 
         boundary = valid_region.shell.points
-        holes = self._obstacle_processor.extract_holes(valid_region)
+        holes = self._collect_inner_obstacles(valid_region.shell, polygons)
         holes = self._obstacle_processor.normalize_holes(valid_region.shell, holes)
         cuts = self._extract_cuts(open_contours, settings.contour_epsilon)
         self._mesher = AdvancingFrontMesher(
@@ -279,6 +279,42 @@ class TriangulationAdapter:
                 graph.setdefault(a, set()).add(b)
                 graph.setdefault(b, set()).add(a)
         return graph
+
+    def _collect_inner_obstacles(self, shell: RegionPolygon, polygons: list[RegionPolygon]) -> list[RegionPolygon]:
+        obstacles: list[RegionPolygon] = []
+        for polygon in polygons:
+            if polygon is shell:
+                continue
+            if not polygon.points:
+                continue
+            probe = self._representative_point(polygon.points)
+            if point_in_polygon(probe, shell.points, include_boundary=True):
+                obstacles.append(polygon)
+        return obstacles
+
+    def _representative_point(self, polygon: list[Point]) -> Point:
+        if not polygon:
+            return Point(0.0, 0.0)
+
+        area2 = 0.0
+        cx_acc = 0.0
+        cy_acc = 0.0
+        n = len(polygon)
+        for i in range(n):
+            p1 = polygon[i]
+            p2 = polygon[(i + 1) % n]
+            cross = p1.x * p2.y - p2.x * p1.y
+            area2 += cross
+            cx_acc += (p1.x + p2.x) * cross
+            cy_acc += (p1.y + p2.y) * cross
+
+        if abs(area2) <= 1e-12:
+            avg_x = sum(point.x for point in polygon) / len(polygon)
+            avg_y = sum(point.y for point in polygon) / len(polygon)
+            return Point(avg_x, avg_y)
+
+        factor = 1.0 / (3.0 * area2)
+        return Point(cx_acc * factor, cy_acc * factor)
 
     def _resolve_settings(
         self,

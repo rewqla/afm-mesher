@@ -34,11 +34,28 @@ class RegionClassifier:
         parent: int | None = None
         for candidate_idx in range(idx):
             candidate_polygon = polygons[candidate_idx]
-            if point_in_polygon(candidate_point, candidate_polygon.points, include_boundary=False):
+            if point_in_polygon(candidate_point, candidate_polygon.points, include_boundary=True):
                 parent = candidate_idx
         return parent
 
     def _representative_point(self, points: list[Point]) -> Point:
+        # Avoid using a boundary vertex as representative point.
+        centroid = self._polygon_centroid(points)
+        if point_in_polygon(centroid, points, include_boundary=False):
+            return centroid
+
+        avg_x = sum(point.x for point in points) / len(points)
+        avg_y = sum(point.y for point in points) / len(points)
+        average = Point(avg_x, avg_y)
+        if point_in_polygon(average, points, include_boundary=False):
+            return average
+
+        for point in points:
+            probe = Point((point.x + centroid.x) * 0.5, (point.y + centroid.y) * 0.5)
+            if point_in_polygon(probe, points, include_boundary=False):
+                return probe
+
+        # Fallback for degenerate/near-degenerate shapes.
         return points[0]
 
     def _depth(self, idx: int, parent_idx: dict[int, int | None]) -> int:
@@ -58,3 +75,23 @@ class RegionClassifier:
             area += p1.x * p2.y - p2.x * p1.y
         return area / 2.0
 
+    def _polygon_centroid(self, polygon: list[Point]) -> Point:
+        area2 = 0.0
+        cx_acc = 0.0
+        cy_acc = 0.0
+        n = len(polygon)
+        for i in range(n):
+            p1 = polygon[i]
+            p2 = polygon[(i + 1) % n]
+            cross = p1.x * p2.y - p2.x * p1.y
+            area2 += cross
+            cx_acc += (p1.x + p2.x) * cross
+            cy_acc += (p1.y + p2.y) * cross
+
+        if abs(area2) <= 1e-12:
+            avg_x = sum(point.x for point in polygon) / max(1, len(polygon))
+            avg_y = sum(point.y for point in polygon) / max(1, len(polygon))
+            return Point(avg_x, avg_y)
+
+        factor = 1.0 / (3.0 * area2)
+        return Point(cx_acc * factor, cy_acc * factor)

@@ -10,6 +10,17 @@ from src.infrastructure.image.photo_preprocessor import simplify_contour
 from math import ceil, floor
 from PIL import Image, ImageDraw
 
+try:
+    from shapely.geometry import GeometryCollection, MultiPolygon, Polygon
+    from shapely.geometry.polygon import orient as orient_polygon
+    from shapely.ops import unary_union
+
+    _HAS_SHAPELY = True
+except ImportError:  # pragma: no cover - optional dependency path
+    GeometryCollection = MultiPolygon = Polygon = None  # type: ignore[assignment]
+    orient_polygon = unary_union = None  # type: ignore[assignment]
+    _HAS_SHAPELY = False
+
 
 class ObstacleProcessor:
     def extract_holes(self, region: ClassifiedRegion) -> list[RegionPolygon]:
@@ -18,10 +29,18 @@ class ObstacleProcessor:
     def normalize_holes(self, shell: RegionPolygon, holes: list[RegionPolygon]) -> list[RegionPolygon]:
         if not holes:
             return []
+        holes = self._filter_micro_holes(shell, holes)
+        if not holes:
+            return []
         if len(holes) == 1:
             return [holes[0]]
         if not self._holes_need_union(holes):
             return sorted(holes, key=lambda polygon: abs(self._signed_area(polygon.points)), reverse=True)
+
+        if _HAS_SHAPELY:
+            normalized = self._normalize_holes_with_shapely(shell, holes)
+            if normalized:
+                return sorted(normalized, key=lambda polygon: abs(self._signed_area(polygon.points)), reverse=True)
 
         # The editor works in pixel geometry, so we merge overlapping/touching holes
         # by rasterizing them into a temporary mask and extracting the merged contour set.
@@ -42,6 +61,55 @@ class ObstacleProcessor:
             raise ValueError("Failed to normalize overlapping holes.")
 
         return sorted(normalized, key=lambda polygon: abs(self._signed_area(polygon.points)), reverse=True)
+
+    def _normalize_holes_with_shapely(self, shell: RegionPolygon, holes: list[RegionPolygon]) -> list[RegionPolygon]:
+        if not _HAS_SHAPELY:
+            return []
+
+        shell_polygon = self._to_shapely_polygon(shell.points)
+        if shell_polygon is None:
+            return []
+        shell_polygon = shell_polygon.buffer(0)
+        if shell_polygon.is_empty:
+            return []
+
+        hole_polygons = [self._to_shapely_polygon(hole.points) for hole in holes]
+        hole_polygons = [polygon.buffer(0) for polygon in hole_polygons if polygon is not None]
+        hole_polygons = [polygon for polygon in hole_polygons if not polygon.is_empty and polygon.area > 0.0]
+        if not hole_polygons:
+            return []
+
+        merged = unary_union(hole_polygons)
+        if merged.is_empty:
+            return []
+
+        # Merge contours that only touch at a point or have tiny gaps from raster/input noise.
+        tolerance = self._merge_tolerance(shell.points, holes)
+        if tolerance > 0.0:
+            merged = merged.buffer(tolerance, join_style=2).buffer(-tolerance, join_style=2)
+            merged = merged.buffer(0)
+        if merged.is_empty:
+            return []
+
+        clipped = merged.intersection(shell_polygon)
+        clipped = clipped.buffer(0)
+        if clipped.is_empty:
+            return []
+
+        polygons = self._extract_polygons(clipped)
+        if not polygons:
+            return []
+
+        normalized: list[RegionPolygon] = []
+        for polygon in polygons:
+            if polygon.is_empty or polygon.area <= 0.0:
+                continue
+            oriented = orient_polygon(polygon, sign=-1.0)
+            points = self._ring_to_points(list(oriented.exterior.coords))
+            if len(points) < 3:
+                continue
+            normalized.append(RegionPolygon(points=points))
+        return normalized
 
     def filter_triangles_by_holes(self, triangles: list[Triangle], holes: list[RegionPolygon]) -> list[Triangle]:
         if not holes:
@@ -189,3 +257,61 @@ class ObstacleProcessor:
             p2 = points[(idx + 1) % n]
             area += p1.x * p2.y - p2.x * p1.y
         return area / 2.0
+
+    def _to_shapely_polygon(self, points: list[Point]) -> Polygon | None:
+        if not _HAS_SHAPELY:
+            return None
+        unique = self._remove_duplicate_consecutive(points)
+        if len(unique) < 3:
+            return None
+        coords = [(point.x, point.y) for point in unique]
+        return Polygon(coords)
+
+    def _merge_tolerance(self, shell_points: list[Point], holes: list[RegionPolygon]) -> float:
+        min_x = min(point.x for point in shell_points)
+        max_x = max(point.x for point in shell_points)
+        min_y = min(point.y for point in shell_points)
+        max_y = max(point.y for point in shell_points)
+        domain_scale = max(max_x - min_x, max_y - min_y, 1.0)
+        tolerance = domain_scale * 1e-6
+
+        min_edge = float("inf")
+        for hole in holes:
+            hole_points = self._remove_duplicate_consecutive(hole.points)
+            for idx in range(len(hole_points)):
+                p1 = hole_points[idx]
+                p2 = hole_points[(idx + 1) % len(hole_points)]
+                edge = ((p2.x - p1.x) ** 2 + (p2.y - p1.y) ** 2) ** 0.5
+                if edge > 0.0:
+                    min_edge = min(min_edge, edge)
+        if min_edge != float("inf"):
+            tolerance = max(tolerance, min_edge * 1e-4)
+        return tolerance
+
+    def _extract_polygons(self, geometry: Polygon | MultiPolygon | GeometryCollection) -> list[Polygon]:
+        if not _HAS_SHAPELY:
+            return []
+        if isinstance(geometry, Polygon):
+            return [geometry]
+        if isinstance(geometry, MultiPolygon):
+            return [poly for poly in geometry.geoms if isinstance(poly, Polygon)]
+        if isinstance(geometry, GeometryCollection):
+            polygons: list[Polygon] = []
+            for geom in geometry.geoms:
+                polygons.extend(self._extract_polygons(geom))
+            return polygons
+        return []
+
+    def _ring_to_points(self, coords: list[tuple[float, float]]) -> list[Point]:
+        points: list[Point] = [Point(float(x), float(y)) for x, y in coords[:-1]]
+        return self._remove_duplicate_consecutive(points)
+
+    def _filter_micro_holes(self, shell: RegionPolygon, holes: list[RegionPolygon]) -> list[RegionPolygon]:
+        shell_area = abs(self._signed_area(shell.points))
+        if shell_area <= 0.0:
+            return holes
+
+        # Reject tiny artifacts from antialiasing/mesh overlays while keeping intended obstacles.
+        min_area = max(4.0, shell_area * 1e-4)
+        filtered = [hole for hole in holes if abs(self._signed_area(hole.points)) >= min_area and len(hole.points) >= 3]
+        return filtered
