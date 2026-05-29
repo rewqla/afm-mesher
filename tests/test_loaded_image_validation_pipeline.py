@@ -260,7 +260,7 @@ class TestLoadedImageValidationPipeline(unittest.TestCase):
         self.assertEqual(len(boundary), 4)
         self.assertEqual(len(holes), 2)
 
-    def test_adapter_collects_nested_inner_polygons_as_obstacles(self) -> None:
+    def test_adapter_ignores_island_inside_hole(self) -> None:
         outer = [(0, 0), (40, 0), (40, 40), (0, 40), (0, 0)]
         hole_like = [(8, 8), (32, 8), (32, 32), (8, 32), (8, 8)]
         island_like = [(14, 14), (26, 14), (26, 26), (14, 26), (14, 14)]
@@ -275,7 +275,7 @@ class TestLoadedImageValidationPipeline(unittest.TestCase):
         self.assertGreaterEqual(coefficient, 0.0)
         boundary, holes, _ = generate.call_args.args[-3:]
         self.assertEqual(len(boundary), 4)
-        self.assertGreaterEqual(len(holes), 1)
+        self.assertEqual(len(holes), 1)
 
     def test_adapter_merges_touching_holes_chain_into_single_obstacle(self) -> None:
         outer = [(0, 0), (60, 0), (60, 40), (0, 40), (0, 0)]
@@ -425,22 +425,66 @@ class TestLoadedImageValidationPipeline(unittest.TestCase):
         self.assertGreaterEqual(len(first_cuts), 1)
         self.assertLessEqual(len(second_cuts), len(first_cuts))
 
-    def test_adapter_falls_back_to_no_cuts_when_previous_attempts_fail(self) -> None:
+    def test_adapter_falls_back_to_no_cuts_when_cut_attempts_fail(self) -> None:
+        outer = [(0, 0), (120, 0), (120, 120), (0, 120), (0, 0)]
+        hole = [(40, 40), (80, 40), (80, 80), (40, 80), (40, 40)]
+        cut_1 = [(10, 30), (110, 30)]
+        cut_2 = [(15, 30), (105, 30)]
+        mesh = Mesh(triangles=[Triangle(Point(0, 0), Point(1, 0), Point(0, 1))])
+
+        with patch("src.application.services.advancing_front_mesher.AdvancingFrontMesher.generate_with_holes_and_cuts") as generate:
+            generate.side_effect = [
+                ValueError("Overlapping collinear cut segments are not supported."),
+                ValueError("Overlapping collinear cut segments are not supported."),
+                mesh,
+            ]
+            result_mesh, coefficient = self.adapter.run_from_contours([outer, hole, cut_1, cut_2])
+
+        self.assertEqual(result_mesh.triangles, mesh.triangles)
+        self.assertGreaterEqual(coefficient, 0.0)
+        self.assertEqual(generate.call_count, 3)
+        first_cuts = generate.call_args_list[0].args[-1]
+        second_cuts = generate.call_args_list[1].args[-1]
+        third_cuts = generate.call_args_list[2].args[-1]
+        self.assertGreaterEqual(len(first_cuts), 1)
+        self.assertLessEqual(len(second_cuts), len(first_cuts))
+        self.assertEqual(third_cuts, [])
+
+    def test_adapter_no_cuts_fallback_keeps_holes(self) -> None:
+        outer = [(0, 0), (120, 0), (120, 120), (0, 120), (0, 0)]
+        hole_1 = [(20, 20), (40, 20), (40, 40), (20, 40), (20, 20)]
+        hole_2 = [(70, 70), (95, 70), (95, 95), (70, 95), (70, 70)]
+        cut_1 = [(10, 60), (110, 60)]
+        cut_2 = [(15, 60), (105, 60)]
+        mesh = Mesh(triangles=[Triangle(Point(0, 0), Point(1, 0), Point(0, 1))])
+
+        with patch("src.application.services.advancing_front_mesher.AdvancingFrontMesher.generate_with_holes_and_cuts") as generate:
+            generate.side_effect = [
+                ValueError("Overlapping collinear cut segments are not supported."),
+                ValueError("Overlapping collinear cut segments are not supported."),
+                mesh,
+            ]
+            self.adapter.run_from_contours([outer, hole_1, hole_2, cut_1, cut_2])
+
+        final_boundary, final_holes, final_cuts = generate.call_args_list[2].args[-3:]
+        self.assertEqual(len(final_boundary), 4)
+        self.assertEqual(len(final_holes), 2)
+        self.assertEqual(final_cuts, [])
+
+    def test_adapter_raises_when_all_cut_attempts_fail(self) -> None:
         outer = [(0, 0), (120, 0), (120, 120), (0, 120), (0, 0)]
         cut = [(10, 40), (100, 40)]
-        mesh = Mesh(triangles=[Triangle(Point(0, 0), Point(1, 0), Point(0, 1))])
 
         with patch("src.application.services.advancing_front_mesher.AdvancingFrontMesher.generate_with_holes_and_cuts") as generate:
             generate.side_effect = [
                 ValueError("AFM stalled: active front cannot be advanced further."),
                 ValueError("AFM stalled: active front cannot be advanced further."),
-                mesh,
+                ValueError("AFM stalled: active front cannot be advanced further."),
             ]
-            self.adapter.run_from_contours([outer, cut])
+            with self.assertRaises(ValueError):
+                self.adapter.run_from_contours([outer, cut])
 
         self.assertEqual(generate.call_count, 3)
-        third_cuts = generate.call_args_list[2].args[-1]
-        self.assertEqual(third_cuts, [])
 
     def _blank_image(self) -> QImage:
         image = QImage(120, 120, QImage.Format.Format_RGB32)

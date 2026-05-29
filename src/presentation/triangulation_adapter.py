@@ -104,8 +104,9 @@ class TriangulationAdapter:
         self._build_topology_graph(valid_region)
 
         boundary = valid_region.shell.points
-        # Validate-by-shell mode: keep closed inner obstacles, ignore open cuts.
-        holes = self._collect_inner_obstacles(valid_region.shell, polygons)
+        # Validate-by-shell mode: use only first-level inner contours as holes.
+        # Nested contours inside those holes are excluded from triangulation input.
+        holes = self._collect_shell_holes(valid_region)
         holes = self._obstacle_processor.normalize_holes(valid_region.shell, holes)
         cuts = self._extract_cuts(open_contours, settings.contour_epsilon)
         cuts = self._filter_cuts_conflicting_with_holes(cuts, holes)
@@ -117,11 +118,10 @@ class TriangulationAdapter:
             smoothing_iterations=settings.smoothing_iterations,
         )
         hole_points = [hole.points for hole in holes]
-        attempted_cuts = [
-            cuts,
-            self._prune_overlapping_collinear_cuts(cuts),
-            [],
-        ]
+        attempted_cuts = [cuts, self._prune_overlapping_collinear_cuts(cuts)]
+        if cuts:
+            # Last-resort fallback: ignore problematic cuts and keep shell+holes triangulation.
+            attempted_cuts.append([])
         mesh: Mesh | None = None
         last_error: ValueError | None = None
         for candidate_cuts in attempted_cuts:
@@ -471,17 +471,15 @@ class TriangulationAdapter:
                 graph.setdefault(b, set()).add(a)
         return graph
 
-    def _collect_inner_obstacles(self, shell: RegionPolygon, polygons: list[RegionPolygon]) -> list[RegionPolygon]:
-        obstacles: list[RegionPolygon] = []
-        for polygon in polygons:
-            if polygon is shell:
+    def _collect_shell_holes(self, region: ClassifiedRegion) -> list[RegionPolygon]:
+        holes: list[RegionPolygon] = []
+        for hole in region.holes:
+            if not hole.points:
                 continue
-            if not polygon.points:
-                continue
-            probe = self._representative_point(polygon.points)
-            if point_in_polygon(probe, shell.points, include_boundary=True):
-                obstacles.append(polygon)
-        return obstacles
+            probe = self._representative_point(hole.points)
+            if point_in_polygon(probe, region.shell.points, include_boundary=True):
+                holes.append(hole)
+        return holes
 
     def _representative_point(self, polygon: list[Point]) -> Point:
         if not polygon:
