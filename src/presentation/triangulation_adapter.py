@@ -120,11 +120,12 @@ class TriangulationAdapter:
         cuts = [cut for cut in cuts if len(cut) >= 2]
         cuts = self._filter_cuts_conflicting_with_holes(cuts, holes)
         cuts = self._merge_collinear_overlapping_cuts(cuts)
+        runtime_settings = self._adaptive_runtime_settings(settings, boundary)
         self._mesher = AdvancingFrontMesher(
-            min_triangle_quality=settings.min_triangle_quality,
-            max_iterations_factor=settings.max_iterations_factor,
-            target_edge_length=settings.target_edge_length,
-            smoothing_iterations=settings.smoothing_iterations,
+            min_triangle_quality=runtime_settings.min_triangle_quality,
+            max_iterations_factor=runtime_settings.max_iterations_factor,
+            target_edge_length=runtime_settings.target_edge_length,
+            smoothing_iterations=runtime_settings.smoothing_iterations,
         )
         hole_points = [hole.points for hole in holes]
         attempted_cuts = [cuts, self._prune_overlapping_collinear_cuts(cuts)]
@@ -560,6 +561,39 @@ class TriangulationAdapter:
                 meters_per_pixel=1.0,
             )
         return self._preset_settings(TriangulationMode.BALANCED)
+
+    def _adaptive_runtime_settings(
+        self,
+        settings: TriangulationSettings,
+        boundary: list[Point],
+    ) -> TriangulationSettings:
+        # Large domains are expensive for AFM. Keep UI responsive by loosening
+        # meshing density and smoothing while preserving user intent for small/medium shapes.
+        area = self._polygon_area(boundary)
+        perimeter = 0.0
+        for i in range(len(boundary)):
+            perimeter += hypot(
+                boundary[(i + 1) % len(boundary)].x - boundary[i].x,
+                boundary[(i + 1) % len(boundary)].y - boundary[i].y,
+            )
+        rough_front_nodes = perimeter / max(settings.target_edge_length, 1e-6)
+
+        if area < 2.0e5 and rough_front_nodes < 240:
+            return settings
+
+        boosted_h = max(
+            settings.target_edge_length,
+            min(settings.target_edge_length * 1.5, settings.target_edge_length + 14.0),
+        )
+        reduced_smoothing = min(settings.smoothing_iterations, 2)
+        reduced_iter_factor = min(settings.max_iterations_factor, 180)
+
+        return replace(
+            settings,
+            target_edge_length=boosted_h,
+            smoothing_iterations=reduced_smoothing,
+            max_iterations_factor=reduced_iter_factor,
+        )
 
     def _optimize_polygon_for_meshing(self, points: list[Point], target_h: float, max_points: int) -> list[Point]:
         if len(points) <= max_points:

@@ -11,7 +11,7 @@ from src.domain.entities.mesh import Mesh
 from src.domain.entities.point import Point
 from src.domain.entities.triangle import Triangle
 from src.application.services.region_topology import RegionPolygon
-from src.presentation.tools import Tool
+from src.presentation.tools import Tool, TriangulationMode
 from src.presentation.paint_app import PaintApp
 from src.presentation.triangulation_adapter import TriangulationAdapter
 
@@ -514,6 +514,21 @@ class TestLoadedImageValidationPipeline(unittest.TestCase):
 
         self.assertGreater(len(mesh.triangles), 0)
         self.assertGreaterEqual(coefficient, 0.0)
+
+    def test_adapter_adaptive_runtime_settings_relaxes_large_domain(self) -> None:
+        settings = self.adapter.preset_settings(TriangulationMode.BALANCED)
+        boundary = [
+            Point(0.0, 0.0),
+            Point(1200.0, 0.0),
+            Point(1200.0, 900.0),
+            Point(0.0, 900.0),
+        ]
+
+        adapted = self.adapter._adaptive_runtime_settings(settings, boundary)  # noqa: SLF001
+
+        self.assertGreaterEqual(adapted.target_edge_length, settings.target_edge_length)
+        self.assertLessEqual(adapted.smoothing_iterations, settings.smoothing_iterations)
+        self.assertLessEqual(adapted.max_iterations_factor, settings.max_iterations_factor)
 
     def _blank_image(self) -> QImage:
         image = QImage(120, 120, QImage.Format.Format_RGB32)
