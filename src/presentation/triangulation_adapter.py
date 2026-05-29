@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from dataclasses import replace
-from math import hypot, isclose
+from math import ceil, hypot, isclose
 from typing import ClassVar
 
 from PySide6.QtGui import QColor, QImage
@@ -108,7 +108,16 @@ class TriangulationAdapter:
         # Nested contours inside those holes are excluded from triangulation input.
         holes = self._collect_shell_holes(valid_region)
         holes = self._obstacle_processor.normalize_holes(valid_region.shell, holes)
+        boundary = self._optimize_polygon_for_meshing(boundary, settings.target_edge_length, max_points=1400)
+        holes = [
+            RegionPolygon(
+                points=self._optimize_polygon_for_meshing(hole.points, settings.target_edge_length, max_points=600)
+            )
+            for hole in holes
+        ]
         cuts = self._extract_cuts(open_contours, settings.contour_epsilon)
+        cuts = [self._optimize_polyline_for_meshing(cut, settings.target_edge_length, max_points=500) for cut in cuts]
+        cuts = [cut for cut in cuts if len(cut) >= 2]
         cuts = self._filter_cuts_conflicting_with_holes(cuts, holes)
         cuts = self._merge_collinear_overlapping_cuts(cuts)
         self._mesher = AdvancingFrontMesher(
@@ -551,3 +560,63 @@ class TriangulationAdapter:
                 meters_per_pixel=1.0,
             )
         return self._preset_settings(TriangulationMode.BALANCED)
+
+    def _optimize_polygon_for_meshing(self, points: list[Point], target_h: float, max_points: int) -> list[Point]:
+        if len(points) <= max_points:
+            return points
+
+        step = max(1, ceil(len(points) / max_points))
+        decimated = [points[i] for i in range(0, len(points), step)]
+        if len(decimated) < 3:
+            return points
+
+        tol = max(0.5, target_h * 0.1)
+        simplified = self._remove_near_collinear_points(decimated, tolerance=tol, closed=True)
+        return simplified if len(simplified) >= 3 else decimated
+
+    def _optimize_polyline_for_meshing(self, points: list[Point], target_h: float, max_points: int) -> list[Point]:
+        if len(points) <= max_points:
+            return points
+        step = max(1, ceil(len(points) / max_points))
+        decimated = [points[i] for i in range(0, len(points), step)]
+        if decimated[-1] != points[-1]:
+            decimated.append(points[-1])
+        tol = max(0.5, target_h * 0.1)
+        simplified = self._remove_near_collinear_points(decimated, tolerance=tol, closed=False)
+        return simplified if len(simplified) >= 2 else decimated
+
+    def _remove_near_collinear_points(self, points: list[Point], tolerance: float, closed: bool) -> list[Point]:
+        if len(points) < (3 if closed else 2):
+            return points
+        working = points[:]
+        changed = True
+        while changed and len(working) >= (4 if closed else 3):
+            changed = False
+            next_points: list[Point] = []
+            length = len(working)
+            for i, curr in enumerate(working):
+                if not closed and (i == 0 or i == length - 1):
+                    next_points.append(curr)
+                    continue
+                prev = working[i - 1]
+                nxt = working[(i + 1) % length]
+                if self._point_to_segment_distance(curr, prev, nxt) <= tolerance:
+                    changed = True
+                    continue
+                next_points.append(curr)
+            if len(next_points) == len(working):
+                break
+            working = next_points
+        return working
+
+    def _point_to_segment_distance(self, p: Point, a: Point, b: Point) -> float:
+        dx = b.x - a.x
+        dy = b.y - a.y
+        denom = dx * dx + dy * dy
+        if denom <= 1e-12:
+            return hypot(p.x - a.x, p.y - a.y)
+        t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / denom
+        t = min(1.0, max(0.0, t))
+        proj_x = a.x + t * dx
+        proj_y = a.y + t * dy
+        return hypot(p.x - proj_x, p.y - proj_y)

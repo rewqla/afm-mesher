@@ -486,6 +486,35 @@ class TestLoadedImageValidationPipeline(unittest.TestCase):
 
         self.assertEqual(generate.call_count, 3)
 
+    def test_adapter_optimizes_large_polygon_for_meshing(self) -> None:
+        points = [Point(float(i), 0.0) for i in range(2200)]
+        # close a narrow loop
+        points.extend([Point(2199.0, 10.0), Point(0.0, 10.0)])
+
+        optimized = self.adapter._optimize_polygon_for_meshing(points, target_h=20.0, max_points=400)  # noqa: SLF001
+
+        self.assertLessEqual(len(optimized), 400)
+        self.assertGreaterEqual(len(optimized), 3)
+
+    def test_adapter_handles_large_noisy_contour_without_stalling(self) -> None:
+        outer: list[tuple[int, int]] = []
+        for x in range(0, 400, 2):
+            outer.append((x, 0 if (x // 2) % 2 == 0 else 1))
+        for y in range(0, 300, 2):
+            outer.append((399, y))
+        for x in range(399, -1, -2):
+            outer.append((x, 299 if (x // 2) % 2 == 0 else 298))
+        for y in range(299, -1, -2):
+            outer.append((0, y))
+        outer.append(outer[0])
+
+        hole = [(140, 90), (260, 90), (260, 210), (140, 210), (140, 90)]
+
+        mesh, coefficient = self.adapter.run_from_contours([outer, hole])
+
+        self.assertGreater(len(mesh.triangles), 0)
+        self.assertGreaterEqual(coefficient, 0.0)
+
     def _blank_image(self) -> QImage:
         image = QImage(120, 120, QImage.Format.Format_RGB32)
         image.fill(QColor(Qt.GlobalColor.white))

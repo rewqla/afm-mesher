@@ -639,6 +639,33 @@ class TestAdvancingFrontMesher(unittest.TestCase):
         self.assertEqual(triangles[0][1], triangles[1][0])
         self.assertEqual(triangles[0][2], triangles[1][2])
 
+    def test_generate_with_holes_and_cuts_retries_after_single_pass_failure(self) -> None:
+        mesher = AdvancingFrontMesher(
+            min_triangle_quality=0.0,
+            target_edge_length=20.0,
+            smoothing_iterations=0,
+        )
+        boundary = [
+            Point(0.0, 0.0),
+            Point(80.0, 0.0),
+            Point(80.0, 80.0),
+            Point(0.0, 80.0),
+        ]
+        fake_mesh = Mesh(triangles=[Triangle(Point(0.0, 0.0), Point(1.0, 0.0), Point(0.0, 1.0))])
+
+        with (
+            patch.object(
+                mesher,
+                "_generate_single_pass",
+                side_effect=[ValueError("AFM stalled: active front cannot be advanced further."), (fake_mesh, boundary, [])],
+            ) as generate_single_pass,
+            patch.object(mesher, "_validate_cut_segments_are_mesh_edges", return_value=None),
+        ):
+            mesh = mesher.generate_with_holes_and_cuts(boundary, holes=[], cuts=[])
+
+        self.assertEqual(mesh.triangles, fake_mesh.triangles)
+        self.assertEqual(generate_single_pass.call_count, 2)
+
     def _assert_triangles_inside_polygon(self, mesh, polygon: list[Point]) -> None:
         for triangle in mesh.triangles:
             centroid = Point(

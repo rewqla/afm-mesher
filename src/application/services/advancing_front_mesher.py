@@ -21,6 +21,7 @@ Segment = tuple[Point, Point]
 _EPSILON = 1e-9
 _KEY_PRECISION = 10
 _MAX_EAR_DIAGONAL_FACTOR = 2.4
+_MAX_FRONT_CANDIDATE_SCAN = 256
 
 
 class AdvancingFrontMesher(IMeshGenerator):
@@ -72,14 +73,21 @@ class AdvancingFrontMesher(IMeshGenerator):
         best_quality = -1.0
         quality_target = 0.7
 
-        for attempt in range(4):
-            target_h = base_h * (0.8 ** attempt)
-            mesh, fixed_boundaries, pass_cut_segments = self._generate_single_pass(
-                polygon,
-                hole_polygons,
-                cut_segments,
-                target_h,
-            )
+        attempt_scales = (1.0, 1.2, 0.85, 0.7)
+        last_error: ValueError | None = None
+        for target_scale in attempt_scales:
+            target_h = base_h * target_scale
+            try:
+                mesh, fixed_boundaries, pass_cut_segments = self._generate_single_pass(
+                    polygon,
+                    hole_polygons,
+                    cut_segments,
+                    target_h,
+                )
+            except ValueError as error:
+                last_error = error
+                continue
+
             mesh = self.smooth(mesh, boundary=fixed_boundaries, iterations=self._smoothing_iterations)
             self._validate_cut_segments_are_mesh_edges(mesh, pass_cut_segments)
             avg_quality = self._average_mesh_quality(mesh)
@@ -90,7 +98,15 @@ class AdvancingFrontMesher(IMeshGenerator):
             if avg_quality >= quality_target:
                 return mesh
 
+        if best_mesh is None and not hole_polygons and not cut_segments:
+            # Last resort for simple domain: robust ear clipping on outer boundary.
+            fallback = self._ear_clip_polygon(polygon, polygon, holes=[], cut_segments=[])
+            if fallback:
+                return Mesh(triangles=fallback)
+
         if best_mesh is None:
+            if last_error is not None:
+                raise last_error
             raise ValueError("AFM failed to generate mesh.")
         return best_mesh
 
@@ -306,7 +322,11 @@ class AdvancingFrontMesher(IMeshGenerator):
         cut_segments: list[Segment],
         target_step: float,
     ) -> tuple[int, Point, Point, Point] | None:
-        for idx in self._sorted_front_indices_by_priority(front):
+        sorted_indices = self._sorted_front_indices_by_priority(front)
+        if not holes and not cut_segments and len(sorted_indices) > _MAX_FRONT_CANDIDATE_SCAN:
+            sorted_indices = sorted_indices[:_MAX_FRONT_CANDIDATE_SCAN]
+
+        for idx in sorted_indices:
             a, b = front[idx]
             other_edges = front[:idx] + front[idx + 1:]
             candidate = self._find_best_node(a, b, polygon, holes, cut_segments, other_edges, target_step)
