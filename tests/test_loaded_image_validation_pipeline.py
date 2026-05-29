@@ -10,6 +10,7 @@ from src.application.services.boundary_validator import BoundaryValidator
 from src.domain.entities.mesh import Mesh
 from src.domain.entities.point import Point
 from src.domain.entities.triangle import Triangle
+from src.application.services.region_topology import RegionPolygon
 from src.presentation.tools import Tool
 from src.presentation.paint_app import PaintApp
 from src.presentation.triangulation_adapter import TriangulationAdapter
@@ -382,6 +383,64 @@ class TestLoadedImageValidationPipeline(unittest.TestCase):
         self.assertEqual(len(closed), 1)
         self.assertEqual(closed[0][0], closed[0][-1])
         self.assertEqual(len(open_contours), 1)
+
+    def test_adapter_splits_cut_crossing_hole_into_two_segments(self) -> None:
+        hole = RegionPolygon([Point(30, 30), Point(70, 30), Point(70, 70), Point(30, 70)])
+        cut = [Point(10, 50), Point(90, 50)]
+
+        parts = self.adapter._split_cut_by_hole_conflicts(cut, [hole])  # noqa: SLF001
+
+        self.assertEqual(len(parts), 2)
+        self.assertTrue(parts[0][0].x < 30.0 and parts[0][1].x < 30.0)
+        self.assertTrue(parts[1][0].x > 70.0 and parts[1][1].x > 70.0)
+
+    def test_adapter_merges_overlapping_collinear_cuts(self) -> None:
+        cuts = [
+            [Point(10, 30), Point(90, 30)],
+            [Point(20, 30), Point(80, 30)],
+        ]
+
+        merged = self.adapter._merge_collinear_overlapping_cuts(cuts)  # noqa: SLF001
+
+        self.assertEqual(len(merged), 1)
+        seg = merged[0]
+        self.assertAlmostEqual(seg[0].y, 30.0)
+        self.assertAlmostEqual(seg[1].y, 30.0)
+        self.assertLessEqual(min(seg[0].x, seg[1].x), 10.0)
+        self.assertGreaterEqual(max(seg[0].x, seg[1].x), 90.0)
+
+    def test_adapter_falls_back_to_pruned_cuts_after_overlap_error(self) -> None:
+        outer = [(0, 0), (120, 0), (120, 120), (0, 120), (0, 0)]
+        cut_1 = [(10, 30), (95, 30)]
+        cut_2 = [(15, 30), (100, 30)]
+        mesh = Mesh(triangles=[Triangle(Point(0, 0), Point(1, 0), Point(0, 1))])
+
+        with patch("src.application.services.advancing_front_mesher.AdvancingFrontMesher.generate_with_holes_and_cuts") as generate:
+            generate.side_effect = [ValueError("Overlapping collinear cut segments are not supported."), mesh]
+            self.adapter.run_from_contours([outer, cut_1, cut_2])
+
+        self.assertEqual(generate.call_count, 2)
+        first_cuts = generate.call_args_list[0].args[-1]
+        second_cuts = generate.call_args_list[1].args[-1]
+        self.assertGreaterEqual(len(first_cuts), 1)
+        self.assertLessEqual(len(second_cuts), len(first_cuts))
+
+    def test_adapter_falls_back_to_no_cuts_when_previous_attempts_fail(self) -> None:
+        outer = [(0, 0), (120, 0), (120, 120), (0, 120), (0, 0)]
+        cut = [(10, 40), (100, 40)]
+        mesh = Mesh(triangles=[Triangle(Point(0, 0), Point(1, 0), Point(0, 1))])
+
+        with patch("src.application.services.advancing_front_mesher.AdvancingFrontMesher.generate_with_holes_and_cuts") as generate:
+            generate.side_effect = [
+                ValueError("AFM stalled: active front cannot be advanced further."),
+                ValueError("AFM stalled: active front cannot be advanced further."),
+                mesh,
+            ]
+            self.adapter.run_from_contours([outer, cut])
+
+        self.assertEqual(generate.call_count, 3)
+        third_cuts = generate.call_args_list[2].args[-1]
+        self.assertEqual(third_cuts, [])
 
     def _blank_image(self) -> QImage:
         image = QImage(120, 120, QImage.Format.Format_RGB32)

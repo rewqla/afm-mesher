@@ -37,53 +37,13 @@ class BoundaryValidator:
         self._epsilon = epsilon
 
     def validate(self, contours: list[RawContour]) -> BoundaryValidationResult:
+        outer_idx = self._select_outer_contour_index(contours)
+        if outer_idx is not None:
+            return self._validate_single_contour(contours[outer_idx], contour_index=outer_idx)
+
         issues: list[BoundaryValidationIssue] = []
         for idx, contour in enumerate(contours):
-            processed = self._preprocess(contour)
-            if len(processed) < 3:
-                if len(processed) >= 2:
-                    issues.append(
-                        BoundaryValidationIssue(
-                            contour_index=idx,
-                            kind="open_contour",
-                            message="Contour is not closed.",
-                            segment=((processed[0].x, processed[0].y), (processed[-1].x, processed[-1].y)),
-                        )
-                    )
-                    continue
-                issues.append(
-                    BoundaryValidationIssue(
-                        contour_index=idx,
-                        kind="too_few_points",
-                        message="Contour must contain at least 3 points.",
-                    )
-                )
-                continue
-
-            result = validate_contour(processed)
-            if not result.is_closed:
-                issues.append(
-                    BoundaryValidationIssue(
-                        contour_index=idx,
-                        kind="open_contour",
-                        message="Contour is not closed.",
-                        segment=((processed[0].x, processed[0].y), (processed[-1].x, processed[-1].y)),
-                    )
-                )
-                continue
-
-            if not result.is_valid:
-                intersect_point = None
-                if result.intersect_point is not None:
-                    intersect_point = (result.intersect_point.x, result.intersect_point.y)
-                issues.append(
-                    BoundaryValidationIssue(
-                        contour_index=idx,
-                        kind="self_intersection",
-                        message="Contour has self-intersections.",
-                        intersect_point=intersect_point,
-                    )
-                )
+            issues.extend(self._validate_contour_issues(contour, contour_index=idx))
 
         return BoundaryValidationResult(is_valid=not issues, issues=issues)
 
@@ -112,6 +72,74 @@ class BoundaryValidator:
     def _preprocess(self, contour: RawContour) -> list[Point]:
         points = [Point(float(x), float(y)) for x, y in contour]
         return preprocess_contour(points, epsilon=self._epsilon, closure_tolerance=self._closure_tolerance)
+
+    def _validate_single_contour(self, contour: RawContour, *, contour_index: int) -> BoundaryValidationResult:
+        issues = self._validate_contour_issues(contour, contour_index=contour_index)
+        return BoundaryValidationResult(is_valid=not issues, issues=issues)
+
+    def _validate_contour_issues(self, contour: RawContour, *, contour_index: int) -> list[BoundaryValidationIssue]:
+        processed = self._preprocess(contour)
+        if len(processed) < 3:
+            if len(processed) >= 2:
+                return [
+                    BoundaryValidationIssue(
+                        contour_index=contour_index,
+                        kind="open_contour",
+                        message="Contour is not closed.",
+                        segment=((processed[0].x, processed[0].y), (processed[-1].x, processed[-1].y)),
+                    )
+                ]
+            return [
+                BoundaryValidationIssue(
+                    contour_index=contour_index,
+                    kind="too_few_points",
+                    message="Contour must contain at least 3 points.",
+                )
+            ]
+
+        result = validate_contour(processed)
+        if not result.is_closed:
+            return [
+                BoundaryValidationIssue(
+                    contour_index=contour_index,
+                    kind="open_contour",
+                    message="Contour is not closed.",
+                    segment=((processed[0].x, processed[0].y), (processed[-1].x, processed[-1].y)),
+                )
+            ]
+
+        if not result.is_valid:
+            intersect_point = None
+            if result.intersect_point is not None:
+                intersect_point = (result.intersect_point.x, result.intersect_point.y)
+            return [
+                BoundaryValidationIssue(
+                    contour_index=contour_index,
+                    kind="self_intersection",
+                    message="Contour has self-intersections.",
+                    intersect_point=intersect_point,
+                )
+            ]
+
+        return []
+
+    def _select_outer_contour_index(self, contours: list[RawContour]) -> int | None:
+        best_idx: int | None = None
+        best_area = float("-inf")
+        for idx, contour in enumerate(contours):
+            processed = self._preprocess(contour)
+            if len(processed) < 3:
+                continue
+            result = validate_contour(processed)
+            if not result.is_closed:
+                continue
+
+            normalized = [(point.x, point.y) for point in processed]
+            area = abs(self._signed_area(normalized))
+            if area > best_area:
+                best_area = area
+                best_idx = idx
+        return best_idx
 
     def _signed_area(self, contour: RawContour) -> float:
         area = 0.0

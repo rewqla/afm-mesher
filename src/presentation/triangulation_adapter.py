@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from dataclasses import replace
-from math import hypot
+from math import hypot, isclose
 from typing import ClassVar
 
 from PySide6.QtGui import QColor, QImage
@@ -15,7 +15,7 @@ from src.application.services.region_classifier import RegionClassifier
 from src.application.services.region_topology import ClassifiedRegion, RegionPolygon
 from src.domain.entities.point import Point
 from src.domain.entities.mesh import Mesh
-from src.domain.geometry.geometry_utils import mesh_average_quality, point_in_polygon
+from src.domain.geometry.geometry_utils import mesh_average_quality, point_in_polygon, segments_intersect
 from src.infrastructure.image.photo_preprocessor import simplify_contour
 from src.infrastructure.processing.image_boundary_extractor import extract_contours
 from src.infrastructure.processing.stroke_centerline_extractor import (
@@ -104,25 +104,216 @@ class TriangulationAdapter:
         self._build_topology_graph(valid_region)
 
         boundary = valid_region.shell.points
+        # Validate-by-shell mode: keep closed inner obstacles, ignore open cuts.
         holes = self._collect_inner_obstacles(valid_region.shell, polygons)
         holes = self._obstacle_processor.normalize_holes(valid_region.shell, holes)
         cuts = self._extract_cuts(open_contours, settings.contour_epsilon)
+        cuts = self._filter_cuts_conflicting_with_holes(cuts, holes)
+        cuts = self._merge_collinear_overlapping_cuts(cuts)
         self._mesher = AdvancingFrontMesher(
             min_triangle_quality=settings.min_triangle_quality,
             max_iterations_factor=settings.max_iterations_factor,
             target_edge_length=settings.target_edge_length,
             smoothing_iterations=settings.smoothing_iterations,
         )
-        mesh = self._mesher.generate_with_holes_and_cuts(
-            boundary,
-            [hole.points for hole in holes],
+        hole_points = [hole.points for hole in holes]
+        attempted_cuts = [
             cuts,
-        )
+            self._prune_overlapping_collinear_cuts(cuts),
+            [],
+        ]
+        mesh: Mesh | None = None
+        last_error: ValueError | None = None
+        for candidate_cuts in attempted_cuts:
+            try:
+                mesh = self._mesher.generate_with_holes_and_cuts(boundary, hole_points, candidate_cuts)
+                break
+            except ValueError as error:
+                last_error = error
+                continue
+        if mesh is None:
+            if last_error is not None:
+                raise last_error
+            raise ValueError("Triangulation failed.")
         mesh = Mesh(triangles=mesh.triangles, meters_per_pixel=settings.meters_per_pixel)
         if not mesh.triangles:
             raise ValueError("Triangulation produced no valid triangles for the selected region.")
         coefficient = mesh_average_quality(mesh)
         return mesh, coefficient
+
+    def _filter_cuts_conflicting_with_holes(
+        self,
+        cuts: list[list[Point]],
+        holes: list[RegionPolygon],
+    ) -> list[list[Point]]:
+        if not cuts or not holes:
+            return cuts
+        filtered: list[list[Point]] = []
+        for cut in cuts:
+            filtered.extend(self._split_cut_by_hole_conflicts(cut, holes))
+        return filtered
+
+    def _split_cut_by_hole_conflicts(self, cut: list[Point], holes: list[RegionPolygon]) -> list[list[Point]]:
+        if len(cut) < 2:
+            return []
+
+        pieces: list[list[Point]] = []
+        for a, b in zip(cut, cut[1:]):
+            for seg_a, seg_b in self._clip_segment_outside_holes(a, b, holes):
+                pieces.append([seg_a, seg_b])
+        return pieces
+
+    def _clip_segment_outside_holes(
+        self,
+        a: Point,
+        b: Point,
+        holes: list[RegionPolygon],
+    ) -> list[tuple[Point, Point]]:
+        t_values = [0.0, 1.0]
+        for hole in holes:
+            hole_points = hole.points
+            for c, d in zip(hole_points, [*hole_points[1:], hole_points[0]]):
+                t = self._segment_intersection_t(a, b, c, d)
+                if t is not None:
+                    t_values.append(t)
+
+        t_values = sorted(t_values)
+        deduped_t: list[float] = []
+        for t in t_values:
+            if not deduped_t or not isclose(t, deduped_t[-1], abs_tol=1e-9):
+                deduped_t.append(t)
+
+        kept: list[tuple[Point, Point]] = []
+        for t0, t1 in zip(deduped_t, deduped_t[1:]):
+            if t1 - t0 <= 1e-9:
+                continue
+            tm = (t0 + t1) / 2.0
+            midpoint = self._point_on_segment(a, b, tm)
+            if any(point_in_polygon(midpoint, hole.points, include_boundary=True) for hole in holes):
+                continue
+            # Avoid exact touching of hole boundaries: trim interval ends that come from intersections.
+            seg_len = hypot(b.x - a.x, b.y - a.y)
+            offset_t = (0.5 / seg_len) if seg_len > 1e-9 else 0.0
+            dt = min(max(offset_t, 1e-4), (t1 - t0) * 0.25)
+            seg_t0 = t0 + dt if t0 > 0.0 else t0
+            seg_t1 = t1 - dt if t1 < 1.0 else t1
+            if seg_t1 - seg_t0 <= 1e-9:
+                continue
+            p0 = self._point_on_segment(a, b, seg_t0)
+            p1 = self._point_on_segment(a, b, seg_t1)
+            if hypot(p1.x - p0.x, p1.y - p0.y) > 1e-9:
+                kept.append((p0, p1))
+        return kept
+
+    def _point_on_segment(self, a: Point, b: Point, t: float) -> Point:
+        return Point(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+
+    def _segment_intersection_t(self, a: Point, b: Point, c: Point, d: Point) -> float | None:
+        if not segments_intersect(a, b, c, d, include_endpoints=True):
+            return None
+        rx = b.x - a.x
+        ry = b.y - a.y
+        sx = d.x - c.x
+        sy = d.y - c.y
+        denom = rx * sy - ry * sx
+        if abs(denom) <= 1e-12:
+            return None
+        cx = c.x - a.x
+        cy = c.y - a.y
+        t = (cx * sy - cy * sx) / denom
+        if -1e-9 <= t <= 1.0 + 1e-9:
+            return min(1.0, max(0.0, t))
+        return None
+
+    def _merge_collinear_overlapping_cuts(self, cuts: list[list[Point]]) -> list[list[Point]]:
+        segments: list[tuple[Point, Point]] = []
+        for cut in cuts:
+            if len(cut) < 2:
+                continue
+            for a, b in zip(cut, cut[1:]):
+                if hypot(b.x - a.x, b.y - a.y) > 1e-9:
+                    segments.append((a, b))
+
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(segments)):
+                if changed:
+                    break
+                for j in range(i + 1, len(segments)):
+                    merged = self._merge_if_collinear_overlapping(segments[i], segments[j])
+                    if merged is None:
+                        continue
+                    new_segments: list[tuple[Point, Point]] = []
+                    for k, seg in enumerate(segments):
+                        if k in (i, j):
+                            continue
+                        new_segments.append(seg)
+                    new_segments.append(merged)
+                    segments = new_segments
+                    changed = True
+                    break
+
+        return [[a, b] for a, b in segments]
+
+    def _prune_overlapping_collinear_cuts(self, cuts: list[list[Point]]) -> list[list[Point]]:
+        segments: list[tuple[Point, Point]] = []
+        for cut in cuts:
+            if len(cut) < 2:
+                continue
+            for a, b in zip(cut, cut[1:]):
+                if hypot(b.x - a.x, b.y - a.y) > 1e-9:
+                    segments.append((a, b))
+
+        segments.sort(key=lambda s: hypot(s[1].x - s[0].x, s[1].y - s[0].y), reverse=True)
+        kept: list[tuple[Point, Point]] = []
+        for candidate in segments:
+            if any(self._merge_if_collinear_overlapping(candidate, existing) is not None for existing in kept):
+                continue
+            kept.append(candidate)
+        return [[a, b] for a, b in kept]
+
+    def _merge_if_collinear_overlapping(
+        self,
+        first: tuple[Point, Point],
+        second: tuple[Point, Point],
+    ) -> tuple[Point, Point] | None:
+        a, b = first
+        c, d = second
+        vx = b.x - a.x
+        vy = b.y - a.y
+        len_sq = vx * vx + vy * vy
+        if len_sq <= 1e-12:
+            return None
+
+        # Collinearity with pixel-space tolerance (near-collinear strokes should be merged).
+        line_len = hypot(vx, vy)
+        if line_len <= 1e-9:
+            return None
+        cross_c = vx * (c.y - a.y) - vy * (c.x - a.x)
+        cross_d = vx * (d.y - a.y) - vy * (d.x - a.x)
+        dist_c = abs(cross_c) / line_len
+        dist_d = abs(cross_d) / line_len
+        if dist_c > 0.75 or dist_d > 0.75:
+            return None
+
+        def proj_t(p: Point) -> float:
+            return ((p.x - a.x) * vx + (p.y - a.y) * vy) / len_sq
+
+        t0, t1 = sorted((0.0, 1.0))
+        t2, t3 = sorted((proj_t(c), proj_t(d)))
+        overlap_start = max(t0, t2)
+        overlap_end = min(t1, t3)
+        if overlap_end < overlap_start - 1e-9:
+            return None
+
+        merged_start_t = min(t0, t2)
+        merged_end_t = max(t1, t3)
+        start = self._point_on_segment(a, b, merged_start_t)
+        end = self._point_on_segment(a, b, merged_end_t)
+        if hypot(end.x - start.x, end.y - start.y) <= 1e-9:
+            return None
+        return start, end
 
     def preset_settings(self, mode: TriangulationMode) -> TriangulationSettings:
         return self._preset_settings(mode)

@@ -62,6 +62,16 @@ class TestBoundaryValidator(unittest.TestCase):
         self.assertEqual(selected[0], selected[-1])
         self.assertEqual(len(closed), 1)
 
+    def test_validate_checks_only_outer_contour_when_closed_shell_exists(self) -> None:
+        outer = [(0, 0), (30, 0), (30, 30), (0, 30), (0, 0)]
+        inner_open = [(8, 8), (12, 20)]
+
+        result = self.validator.validate([outer, inner_open])
+
+        self.assertTrue(result.is_valid)
+        self.assertEqual(len(result.open_contours), 0)
+        self.assertEqual(len(result.self_intersections), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
