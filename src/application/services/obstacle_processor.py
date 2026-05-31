@@ -149,7 +149,10 @@ class ObstacleProcessor:
     def _polygon_edges(self, points: list[Point]) -> list[tuple[Point, Point]]:
         if len(points) < 2:
             return []
-        return [(points[idx], points[idx + 1]) for idx in range(len(points) - 1)]
+        edges = [(points[idx], points[idx + 1]) for idx in range(len(points) - 1)]
+        if points[0] != points[-1]:
+            edges.append((points[-1], points[0]))
+        return edges
 
     def _point_in_triangle(self, point: Point, triangle: Triangle) -> bool:
         o1 = orientation(triangle.a, triangle.b, point)

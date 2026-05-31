@@ -187,6 +187,19 @@ class TestRegionTopologyServices(unittest.TestCase):
 
         self.assertEqual(len(normalized), 1)
 
+    def test_normalize_holes_merges_when_overlap_is_only_on_closing_edge(self) -> None:
+        shell = self.boundary_detection.detect([[(0, 0), (30, 0), (30, 30), (0, 30), (0, 0)]])[0]
+        holes = self.boundary_detection.detect(
+            [
+                [(4, 4), (12, 4), (12, 12), (4, 12), (4, 4)],
+                [(2, 6), (6, 6), (6, 10), (2, 10), (2, 6)],
+            ]
+        )
+
+        normalized = self.obstacles.normalize_holes(shell, holes)
+
+        self.assertEqual(len(normalized), 1)
+
     def test_normalize_holes_randomized_cluster_count_regression(self) -> None:
         if not _HAS_SHAPELY:
             self.skipTest("Shapely is required for this randomized regression test.")

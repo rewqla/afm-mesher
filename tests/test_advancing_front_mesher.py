@@ -377,6 +377,67 @@ class TestAdvancingFrontMesher(unittest.TestCase):
         for a, b in segments:
             self.assertGreater(distance(a, b), tolerance)
 
+    def test_find_advancement_uses_reversed_edge_recovery_when_forward_fails(self) -> None:
+        boundary = [
+            Point(0.0, 0.0),
+            Point(40.0, 0.0),
+            Point(40.0, 40.0),
+            Point(0.0, 40.0),
+        ]
+        polygon = self.mesher._prepare_boundary(boundary)
+        front = [(Point(10.0, 10.0), Point(20.0, 10.0))]
+        recovery_candidate = Point(15.0, 20.0)
+
+        def fake_find_best_node(
+            a: Point,
+            b: Point,
+            _polygon: list[Point],
+            _holes: list[list[Point]],
+            _cut_segments: list[tuple[Point, Point]],
+            _front: list[tuple[Point, Point]],
+            _target_step: float,
+            *_args: object,
+        ) -> Point | None:
+            if a == front[0][1] and b == front[0][0]:
+                return recovery_candidate
+            return None
+
+        with patch.object(self.mesher, "_find_best_node", side_effect=fake_find_best_node):
+            advancement = self.mesher._find_advancement(
+                front=front,
+                polygon=polygon,
+                holes=[],
+                cut_segments=[],
+                target_step=10.0,
+            )
+
+        self.assertIsNotNone(advancement)
+        idx, a, b, candidate = advancement  # type: ignore[misc]
+        self.assertEqual(idx, 0)
+        self.assertEqual((a, b), (front[0][1], front[0][0]))
+        self.assertEqual(candidate, recovery_candidate)
+
+    def test_find_advancement_returns_none_when_forward_and_reversed_fail(self) -> None:
+        boundary = [
+            Point(0.0, 0.0),
+            Point(40.0, 0.0),
+            Point(40.0, 40.0),
+            Point(0.0, 40.0),
+        ]
+        polygon = self.mesher._prepare_boundary(boundary)
+        front = [(Point(10.0, 10.0), Point(20.0, 10.0))]
+
+        with patch.object(self.mesher, "_find_best_node", return_value=None):
+            advancement = self.mesher._find_advancement(
+                front=front,
+                polygon=polygon,
+                holes=[],
+                cut_segments=[],
+                target_step=10.0,
+            )
+
+        self.assertIsNone(advancement)
+
     def test_reject_invalid_cut_through_hole_with_clear_error(self) -> None:
         boundary = [
             Point(0.0, 0.0),

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import heapq
 from collections import defaultdict
+from datetime import datetime
 from math import ceil, sqrt
+from pathlib import Path
 
 from src.domain.entities.mesh import Mesh
 from src.domain.entities.point import Point
@@ -25,6 +27,19 @@ _KEY_PRECISION = 10
 _MAX_EAR_DIAGONAL_FACTOR = 2.4
 _MAX_FRONT_CANDIDATE_SCAN = 256
 _MAX_DOMAIN_FRONT_POINTS = 240
+_AFM_DEBUG_LOG_PATH = Path.cwd() / "triangulation_debug.log"
+
+
+def _afm_debug(event: str, **fields: object) -> None:
+    timestamp = datetime.now().isoformat(timespec="milliseconds")
+    payload = " ".join(f"{key}={fields[key]!r}" for key in sorted(fields))
+    line = f"{timestamp} [{event}] {payload}\n" if payload else f"{timestamp} [{event}]\n"
+    try:
+        _AFM_DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _AFM_DEBUG_LOG_PATH.open("a", encoding="utf-8") as log_file:
+            log_file.write(line)
+    except OSError:
+        return
 
 
 class AdvancingFrontMesher(IMeshGenerator):
@@ -49,6 +64,7 @@ class AdvancingFrontMesher(IMeshGenerator):
         self._target_edge_length = target_edge_length
         self._smoothing_iterations = smoothing_iterations
         self._steiner_activation_length_factor = 0.95
+        self._debug_progress_interval = 250
 
     def generate(self, boundary: list[Point]) -> Mesh:
         return self.generate_with_holes(boundary, holes=[])
@@ -133,14 +149,36 @@ class AdvancingFrontMesher(IMeshGenerator):
 
         max_iterations = max(200, len(front) * self._max_iterations_factor)
         iterations = 0
+        _afm_debug(
+            "afm.single_pass.start",
+            boundary_points=len(polygon),
+            holes=len(holes),
+            cut_segments=len(pass_cut_segments),
+            front_edges=len(front),
+            target_h=target_h,
+            max_iterations=max_iterations,
+        )
 
         while front and iterations < max_iterations:
+            if iterations == 0 or iterations % self._debug_progress_interval == 0:
+                _afm_debug(
+                    "afm.single_pass.progress",
+                    iteration=iterations,
+                    front_edges=len(front),
+                    triangles=len(triangles),
+                )
             advancement = self._find_advancement(front, polygon, holes, pass_cut_segments, target_h)
             if advancement is None:
+                self._log_stall_diagnostics(front, polygon, holes, pass_cut_segments, target_h)
                 fallback_triangles = self._fallback_triangulate_front(front, polygon, holes, pass_cut_segments)
                 if not fallback_triangles:
                     raise ValueError("AFM stalled: active front cannot be advanced further.")
                 triangles.extend(fallback_triangles)
+                _afm_debug(
+                    "afm.single_pass.fallback_success",
+                    fallback_triangles=len(fallback_triangles),
+                    total_triangles=len(triangles),
+                )
                 front.clear()
                 break
 
@@ -153,6 +191,13 @@ class AdvancingFrontMesher(IMeshGenerator):
             iterations += 1
 
         if front:
+            _afm_debug(
+                "afm.single_pass.iteration_limit",
+                iterations=iterations,
+                max_iterations=max_iterations,
+                front_edges=len(front),
+                triangles=len(triangles),
+            )
             raise ValueError("AFM failed to close the front before iteration limit.")
         if not triangles:
             raise ValueError("AFM failed to generate mesh.")
@@ -163,7 +208,147 @@ class AdvancingFrontMesher(IMeshGenerator):
         for a, b in pass_cut_segments:
             fixed_boundary.append(a)
             fixed_boundary.append(b)
+        _afm_debug("afm.single_pass.done", triangles=len(triangles))
         return Mesh(triangles=triangles), fixed_boundary, pass_cut_segments
+
+    def _log_stall_diagnostics(
+            self,
+            front: list[FrontEdge],
+            polygon: list[Point],
+            holes: list[list[Point]],
+            cut_segments: list[Segment],
+            target_step: float,
+    ) -> None:
+        max_scan = min(len(front), max(_MAX_FRONT_CANDIDATE_SCAN, len(front) // 3)) if (holes or cut_segments) else min(
+            len(front), _MAX_FRONT_CANDIDATE_SCAN
+        )
+        sorted_indices = self._sorted_front_indices_by_priority(front, max_scan=max_scan)
+        all_front_vertices = self._front_vertices(front, exclude=set())
+        front_spatial_index, front_cell_size = self._build_segment_spatial_index(front, target_step)
+        inspected_edges = min(len(sorted_indices), 24)
+
+        reason_counts: dict[str, int] = defaultdict(int)
+        total_candidates = 0
+        candidate_breakdown = {"steiner": 0, "near": 0, "far": 0}
+
+        for idx in sorted_indices[:inspected_edges]:
+            a, b = front[idx]
+            edge_len = distance(a, b)
+            if edge_len <= _EPSILON:
+                reason_counts["degenerate_base_edge"] += 1
+                continue
+
+            midpoint = Point((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)
+            existing_vertices = [p for p in all_front_vertices if p != a and p != b]
+            steiner_candidates: list[Point] = []
+            if edge_len > target_step * self._steiner_activation_length_factor:
+                steiner_candidates = self._steiner_candidates(a, b)
+            near_vertices = [p for p in existing_vertices if distance(p, midpoint) <= edge_len + _EPSILON]
+            near_vertices.sort(key=lambda p: distance(p, midpoint))
+            far_vertices = [p for p in existing_vertices if distance(p, midpoint) <= edge_len * 2.5]
+            far_vertices.sort(key=lambda p: distance(p, midpoint))
+
+            for p in steiner_candidates[:18]:
+                candidate_breakdown["steiner"] += 1
+                total_candidates += 1
+                if self._is_too_close_to_existing_edges(
+                        p,
+                        front,
+                        threshold=0.4 * target_step,
+                        spatial_index=front_spatial_index,
+                        cell_size=front_cell_size,
+                ):
+                    reason_counts["too_close_to_front_edge"] += 1
+                    continue
+                reason = self._triangle_invalid_reason(
+                    a, b, p, polygon, holes, cut_segments, front, front_spatial_index, front_cell_size
+                )
+                if reason is None:
+                    reason_counts["valid_found_but_not_selected"] += 1
+                else:
+                    reason_counts[reason] += 1
+
+            for p in near_vertices[:24]:
+                candidate_breakdown["near"] += 1
+                total_candidates += 1
+                if not self._is_reasonable_closure_candidate(a, b, p, edge_len, max_ratio=1.8):
+                    reason_counts["unreasonable_near_closure"] += 1
+                    continue
+                reason = self._triangle_invalid_reason(
+                    a, b, p, polygon, holes, cut_segments, front, front_spatial_index, front_cell_size
+                )
+                reason_counts["valid_found_but_not_selected" if reason is None else reason] += 1
+
+            for p in far_vertices[:24]:
+                candidate_breakdown["far"] += 1
+                total_candidates += 1
+                if not self._is_reasonable_closure_candidate(a, b, p, edge_len, max_ratio=2.2):
+                    reason_counts["unreasonable_far_closure"] += 1
+                    continue
+                reason = self._triangle_invalid_reason(
+                    a, b, p, polygon, holes, cut_segments, front, front_spatial_index, front_cell_size
+                )
+                reason_counts["valid_found_but_not_selected" if reason is None else reason] += 1
+
+        _afm_debug(
+            "afm.stall_diagnostics",
+            front_edges=len(front),
+            holes=len(holes),
+            cut_segments=len(cut_segments),
+            target_step=target_step,
+            scanned_edges=inspected_edges,
+            total_candidates=total_candidates,
+            steiner_candidates=candidate_breakdown["steiner"],
+            near_candidates=candidate_breakdown["near"],
+            far_candidates=candidate_breakdown["far"],
+            rejection_reasons=dict(sorted(reason_counts.items())),
+        )
+
+    def _triangle_invalid_reason(
+            self,
+            a: Point,
+            b: Point,
+            c: Point,
+            polygon: list[Point],
+            holes: list[list[Point]],
+            cut_segments: list[Segment],
+            front: list[FrontEdge],
+            front_spatial_index: dict[tuple[int, int], list[int]] | None = None,
+            front_cell_size: float | None = None,
+    ) -> str | None:
+        if c == a or c == b:
+            return "same_vertex"
+        if orientation(a, b, c) <= 0:
+            return "non_ccw"
+        if not self._point_in_domain(c, polygon, holes):
+            return "candidate_outside_domain"
+
+        centroid = Point((a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0)
+        if not self._point_in_domain(centroid, polygon, holes):
+            return "centroid_outside_domain"
+        if not self._triangle_respects_holes(a, b, c, holes):
+            return "violates_holes"
+        if not self._triangle_respects_cut_segments(a, b, c, cut_segments):
+            return "violates_cuts"
+        try:
+            quality = triangle_quality(a, b, c)
+        except ValueError:
+            return "degenerate_triangle"
+        if quality < self._min_triangle_quality:
+            return "quality_below_threshold"
+
+        for new_edge in ((a, c), (c, b)):
+            if self._edge_intersects_front(
+                    new_edge,
+                    front,
+                    spatial_index=front_spatial_index,
+                    cell_size=front_cell_size,
+            ):
+                return "intersects_front"
+
+        if self._contains_front_vertex(a, b, c, front):
+            return "contains_front_vertex"
+        return None
 
     def _prepare_boundary(self, boundary: list[Point]) -> list[Point]:
         if len(boundary) < 3:
@@ -356,6 +541,26 @@ class AdvancingFrontMesher(IMeshGenerator):
             )
             if candidate is not None:
                 return idx, a, b, candidate
+        # Recovery path: if no candidate found for edge direction (a->b),
+        # try reversed orientation (b->a). This helps on residual fronts
+        # where local edge orientation becomes inconsistent near closure.
+        for idx in sorted_indices:
+            a, b = front[idx]
+            candidate = self._find_best_node(
+                b,
+                a,
+                polygon,
+                holes,
+                cut_segments,
+                front,
+                target_step,
+                all_front_vertices,
+                front_spatial_index,
+                front_cell_size,
+            )
+            if candidate is not None:
+                _afm_debug("afm.recovery.reversed_edge_used", edge_idx=idx)
+                return idx, b, a, candidate
         return None
 
     def _find_best_node(
