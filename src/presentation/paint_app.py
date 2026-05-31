@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 from src.application.services.boundary_validator import BoundaryValidator
 from src.domain.entities.mesh import Mesh
 from src.presentation.canvas import Canvas
+from src.presentation.tri_debug import tri_debug
 from src.presentation.tools import Tool, TriangulationMode
 from src.presentation.triangulation_adapter import TriangulationAdapter, TriangulationSettings
 
@@ -1096,7 +1097,7 @@ class PaintApp(QMainWindow):
 
     def _set_tool(self, tool: Tool) -> None:
         if tool in (Tool.PEN, Tool.SEGMENT, Tool.RECTANGLE, Tool.CIRCLE, Tool.POINT) and self._canvas.geometry_is_dirty():
-            self._refresh_geometry_from_canvas_image(self._canvas.image_data(), prefer_strokes=True)
+            self._refresh_geometry_from_canvas_image(self._canvas.image_data(), prefer_strokes=False)
         self._canvas.set_tool(tool)
         self._current_tool = tool
         self._tool_status_label.setText(self._t("tool_prefix").format(tool=self._localized_tool_name(tool)))
@@ -1220,14 +1221,40 @@ class PaintApp(QMainWindow):
     def _on_undo(self) -> None:
         if self._triangulation_busy:
             return
+        tri_debug(
+            "paint_app.undo.request",
+            dirty=self._canvas.geometry_is_dirty(),
+            cached_contours=len(self._canvas.geometry_contours()),
+        )
         if not self._canvas.undo():
             self.statusBar().showMessage("Nothing to undo")
+            tri_debug("paint_app.undo.result", status="nothing_to_undo")
+            return
+        tri_debug(
+            "paint_app.undo.result",
+            status="ok",
+            dirty=self._canvas.geometry_is_dirty(),
+            cached_contours=len(self._canvas.geometry_contours()),
+        )
 
     def _on_redo(self) -> None:
         if self._triangulation_busy:
             return
+        tri_debug(
+            "paint_app.redo.request",
+            dirty=self._canvas.geometry_is_dirty(),
+            cached_contours=len(self._canvas.geometry_contours()),
+        )
         if not self._canvas.redo():
             self.statusBar().showMessage("Nothing to redo")
+            tri_debug("paint_app.redo.result", status="nothing_to_redo")
+            return
+        tri_debug(
+            "paint_app.redo.result",
+            status="ok",
+            dirty=self._canvas.geometry_is_dirty(),
+            cached_contours=len(self._canvas.geometry_contours()),
+        )
 
     def _on_triangulation(self) -> None:
         if self._triangulation_busy:
@@ -1292,15 +1319,31 @@ class PaintApp(QMainWindow):
         *,
         prefer_strokes: bool = False,
     ) -> list[list[tuple[int, int]]]:
+        tri_debug(
+            "paint_app.refresh_geometry.start",
+            prefer_strokes=prefer_strokes,
+            dirty=self._canvas.geometry_is_dirty(),
+            cached_contours=len(self._canvas.geometry_contours()),
+        )
         try:
             if prefer_strokes:
                 contours = self._triangulation_adapter.extract_stroke_contours_from_image(image_data)
+                source = "stroke_centerlines"
             else:
                 contours = self._triangulation_adapter.extract_contours_from_image(image_data)
+                source = "boundary_contours"
         except ValueError:
             self._canvas.set_geometry_contours([], preprocess=False, redraw_image=False, emit_change=False)
+            tri_debug("paint_app.refresh_geometry.fail", reason="no_contours")
             return []
         self._canvas.set_geometry_contours(contours, preprocess=False, redraw_image=False, emit_change=False)
+        self._canvas.restore_filled_keys_from_raster()
+        tri_debug(
+            "paint_app.refresh_geometry.done",
+            source=source,
+            contours=len(contours),
+            dirty=self._canvas.geometry_is_dirty(),
+        )
         return self._canvas.geometry_contours()
 
     def _contours_for_triangulation(
@@ -1310,8 +1353,19 @@ class PaintApp(QMainWindow):
         prefer_strokes: bool,
     ) -> list[list[tuple[int, int]]]:
         contours = self._canvas.geometry_contours()
+        tri_debug(
+            "paint_app.contours_for_triangulation.start",
+            prefer_strokes=prefer_strokes,
+            cached_total=len(contours),
+            dirty=self._canvas.geometry_is_dirty(),
+        )
         cached_closed_contours, cached_open_contours = self._split_closed_and_open_contours(contours)
         if cached_closed_contours:
+            tri_debug(
+                "paint_app.contours_for_triangulation.cached_used",
+                closed=len(cached_closed_contours),
+                open=len(cached_open_contours),
+            )
             return [*cached_closed_contours, *cached_open_contours]
         if prefer_strokes:
             try:
@@ -1327,8 +1381,15 @@ class PaintApp(QMainWindow):
                     redraw_image=False,
                     emit_change=False,
                 )
+                self._canvas.restore_filled_keys_from_raster()
+                tri_debug(
+                    "paint_app.contours_for_triangulation.boundary_fill_cache",
+                    closed=len(closed_boundary_contours),
+                    open=len(merged_open_contours),
+                )
                 return self._canvas.geometry_contours()
-        return self._refresh_geometry_from_canvas_image(image_data, prefer_strokes=prefer_strokes)
+            tri_debug("paint_app.contours_for_triangulation.boundary_no_closed")
+        return self._refresh_geometry_from_canvas_image(image_data, prefer_strokes=False)
 
     def _merge_unique_contours(
         self,
@@ -1362,7 +1423,9 @@ class PaintApp(QMainWindow):
         self,
         contours: list[list[tuple[float, float]]],
     ) -> list[list[tuple[float, float]]]:
+        tri_debug("paint_app.prepare_contours.start", total=len(contours))
         closed_contours, open_contours = self._split_closed_and_open_contours(contours)
+        tri_debug("paint_app.prepare_contours.split", closed=len(closed_contours), open=len(open_contours))
         if not closed_contours:
             if open_contours:
                 QMessageBox.information(
@@ -1397,6 +1460,7 @@ class PaintApp(QMainWindow):
                 return []
 
         closed_contours = self._boundary_validator.normalize_valid_closed_contours(closed_contours)
+        tri_debug("paint_app.prepare_contours.done", closed=len(closed_contours), open=len(open_contours))
         return [*closed_contours, *open_contours]
 
     def _latest_open_segment(

@@ -2,7 +2,7 @@ import unittest
 
 import _bootstrap  # noqa: F401
 from PySide6.QtCore import QPoint, QPointF, Qt
-from PySide6.QtGui import QColor, QMouseEvent
+from PySide6.QtGui import QColor, QMouseEvent, QPainter
 from PySide6.QtWidgets import QApplication
 
 from src.presentation.canvas import Canvas
@@ -236,6 +236,23 @@ class TestCanvasContourIntegration(unittest.TestCase):
 
         contour = canvas.geometry_contours()[0]
         self.assertEqual(contour[0], contour[-1])
+
+    def test_restore_filled_keys_from_raster_marks_filled_closed_contour(self) -> None:
+        canvas = Canvas(width=40, height=40)
+        image = canvas.image_data()
+        painter = QPainter(image)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(Qt.GlobalColor.black)
+        painter.drawRect(10, 10, 20, 20)
+        painter.end()
+        canvas.set_image(image, record_history=False)
+        contour = [(10.0, 10.0), (30.0, 10.0), (30.0, 30.0), (10.0, 30.0), (10.0, 10.0)]
+        canvas.set_geometry_contours([contour], preprocess=False, redraw_image=False, emit_change=False)
+
+        canvas.restore_filled_keys_from_raster()
+        canvas._redraw_geometry_layer()  # noqa: SLF001
+
+        self.assertEqual(canvas.image_data().pixelColor(20, 20), QColor(Qt.GlobalColor.black))
 
     def test_resize_canvas_allows_growing_blank_canvas(self) -> None:
         canvas = Canvas(width=300, height=300)

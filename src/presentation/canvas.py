@@ -8,6 +8,7 @@ from src.domain.entities.point import Point
 from src.domain.geometry.contour_pipeline import preprocess_contour, smart_append_contour
 from src.domain.entities.mesh import Mesh
 from src.presentation.tools import Tool
+from src.presentation.tri_debug import tri_debug
 
 
 class Canvas(QWidget):
@@ -145,6 +146,16 @@ class Canvas(QWidget):
         redraw_image: bool = True,
         emit_change: bool = True,
     ) -> None:
+        tri_debug(
+            "canvas.set_geometry_contours.start",
+            incoming_count=len(contours),
+            preprocess=preprocess,
+            redraw_image=redraw_image,
+            emit_change=emit_change,
+            was_dirty=self._geometry_dirty,
+            prev_contours=len(self._geometry_contours),
+            prev_filled_keys=len(self._filled_contour_keys),
+        )
         self._geometry_contours = []
         self._filled_contour_keys.clear()
         for contour in contours:
@@ -155,6 +166,28 @@ class Canvas(QWidget):
         self.update()
         if emit_change:
             self.image_changed.emit()
+        tri_debug(
+            "canvas.set_geometry_contours.done",
+            contours=len(self._geometry_contours),
+            filled_keys=len(self._filled_contour_keys),
+            dirty=self._geometry_dirty,
+        )
+
+    def restore_filled_keys_from_raster(self) -> None:
+        self._filled_contour_keys.clear()
+        restored = 0
+        for contour in self._geometry_contours:
+            if not self._contour_is_closed(contour):
+                continue
+            if self._contour_has_black_interior(contour):
+                self._filled_contour_keys.add(self._contour_key(contour))
+                restored += 1
+        tri_debug(
+            "canvas.restore_filled_keys_from_raster",
+            contours=len(self._geometry_contours),
+            restored=restored,
+            filled_keys=len(self._filled_contour_keys),
+        )
 
     def set_invalid_segments(self, segments: list[tuple[tuple[float, float], tuple[float, float]]]) -> None:
         normalized = [((a[0], a[1]), (b[0], b[1])) for a, b in segments]
@@ -171,7 +204,16 @@ class Canvas(QWidget):
 
     def undo(self) -> bool:
         if not self._undo_stack:
+            tri_debug("canvas.undo.skip", reason="empty_undo_stack")
             return False
+        tri_debug(
+            "canvas.undo.start",
+            undo_size=len(self._undo_stack),
+            redo_size=len(self._redo_stack),
+            contours=len(self._geometry_contours),
+            filled_keys=len(self._filled_contour_keys),
+            dirty=self._geometry_dirty,
+        )
         self._redo_stack.append(self._image.copy())
         self._image = self._undo_stack.pop()
         self._geometry_contours.clear()
@@ -182,11 +224,28 @@ class Canvas(QWidget):
         self._mesh_overlay = None
         self.update()
         self.image_changed.emit()
+        tri_debug(
+            "canvas.undo.done",
+            undo_size=len(self._undo_stack),
+            redo_size=len(self._redo_stack),
+            contours=len(self._geometry_contours),
+            filled_keys=len(self._filled_contour_keys),
+            dirty=self._geometry_dirty,
+        )
         return True
 
     def redo(self) -> bool:
         if not self._redo_stack:
+            tri_debug("canvas.redo.skip", reason="empty_redo_stack")
             return False
+        tri_debug(
+            "canvas.redo.start",
+            undo_size=len(self._undo_stack),
+            redo_size=len(self._redo_stack),
+            contours=len(self._geometry_contours),
+            filled_keys=len(self._filled_contour_keys),
+            dirty=self._geometry_dirty,
+        )
         self._undo_stack.append(self._image.copy())
         self._image = self._redo_stack.pop()
         self._geometry_contours.clear()
@@ -197,6 +256,14 @@ class Canvas(QWidget):
         self._mesh_overlay = None
         self.update()
         self.image_changed.emit()
+        tri_debug(
+            "canvas.redo.done",
+            undo_size=len(self._undo_stack),
+            redo_size=len(self._redo_stack),
+            contours=len(self._geometry_contours),
+            filled_keys=len(self._filled_contour_keys),
+            dirty=self._geometry_dirty,
+        )
         return True
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
@@ -229,6 +296,14 @@ class Canvas(QWidget):
                     sx, sy = self._current_stroke[-1]
                     self._last_point = QPoint(int(round(sx)), int(round(sy)))
             else:
+                tri_debug(
+                    "canvas.eraser.start",
+                    x=point.x(),
+                    y=point.y(),
+                    prev_contours=len(self._geometry_contours),
+                    prev_filled_keys=len(self._filled_contour_keys),
+                    was_dirty=self._geometry_dirty,
+                )
                 self._geometry_contours.clear()
                 self._filled_contour_keys.clear()
                 self._geometry_dirty = True
@@ -534,6 +609,12 @@ class Canvas(QWidget):
         self._geometry_dirty = preserve_dirty
 
     def _redraw_geometry_layer(self) -> None:
+        tri_debug(
+            "canvas.redraw_geometry_layer.start",
+            contours=len(self._geometry_contours),
+            filled_keys=len(self._filled_contour_keys),
+            dirty=self._geometry_dirty,
+        )
         self._image.fill(Qt.GlobalColor.white)
         painter = QPainter(self._image)
         pen = QPen(Qt.GlobalColor.black, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
@@ -558,6 +639,12 @@ class Canvas(QWidget):
                     QPoint(int(round(x2)), int(round(y2))),
                 )
         painter.end()
+        tri_debug(
+            "canvas.redraw_geometry_layer.done",
+            contours=len(self._geometry_contours),
+            filled_keys=len(self._filled_contour_keys),
+            dirty=self._geometry_dirty,
+        )
 
     def _take_continuation_target(
         self,
@@ -623,6 +710,60 @@ class Canvas(QWidget):
         dx = float(a[0]) - float(b[0])
         dy = float(a[1]) - float(b[1])
         return dx * dx + dy * dy
+
+    def _contour_has_black_interior(self, contour: list[tuple[float, float]]) -> bool:
+        if len(contour) < 4:
+            return False
+        xs = [p[0] for p in contour]
+        ys = [p[1] for p in contour]
+        min_x = max(0, int(round(min(xs))))
+        max_x = min(self._image.width() - 1, int(round(max(xs))))
+        min_y = max(0, int(round(min(ys))))
+        max_y = min(self._image.height() - 1, int(round(max(ys))))
+        if min_x >= max_x or min_y >= max_y:
+            return False
+
+        cx = int(round(sum(xs) / len(xs)))
+        cy = int(round(sum(ys) / len(ys)))
+        bx = (min_x + max_x) // 2
+        by = (min_y + max_y) // 2
+        candidates = [(cx, cy), (bx, by)]
+        for x, y in candidates:
+            if self._is_black_inside_contour(x, y, contour):
+                return True
+
+        span_x = max_x - min_x
+        span_y = max_y - min_y
+        step = max(1, min(span_x, span_y) // 8)
+        for y in range(min_y, max_y + 1, step):
+            for x in range(min_x, max_x + 1, step):
+                if self._is_black_inside_contour(x, y, contour):
+                    return True
+        return False
+
+    def _is_black_inside_contour(self, x: int, y: int, contour: list[tuple[float, float]]) -> bool:
+        if not (0 <= x < self._image.width() and 0 <= y < self._image.height()):
+            return False
+        if not self._point_in_contour(float(x), float(y), contour):
+            return False
+        return QColor(self._image.pixel(x, y)).value() <= 127
+
+    def _point_in_contour(self, x: float, y: float, contour: list[tuple[float, float]]) -> bool:
+        inside = False
+        n = len(contour)
+        if n < 3:
+            return False
+        j = n - 1
+        for i in range(n):
+            xi, yi = contour[i]
+            xj, yj = contour[j]
+            intersects = ((yi > y) != (yj > y)) and (
+                x < (xj - xi) * (y - yi) / ((yj - yi) if abs(yj - yi) > 1e-12 else 1e-12) + xi
+            )
+            if intersects:
+                inside = not inside
+            j = i
+        return inside
 
     def _content_bounds(self) -> tuple[int, int, int, int] | None:
         raster_bounds = self._raster_content_bounds()

@@ -10,7 +10,7 @@ from src.application.services.boundary_validator import BoundaryValidator
 from src.domain.entities.mesh import Mesh
 from src.domain.entities.point import Point
 from src.domain.entities.triangle import Triangle
-from src.application.services.region_topology import RegionPolygon
+from src.application.services.region_topology import ClassifiedRegion, RegionPolygon
 from src.presentation.tools import Tool, TriangulationMode
 from src.presentation.paint_app import PaintApp
 from src.presentation.triangulation_adapter import TriangulationAdapter
@@ -220,8 +220,7 @@ class TestLoadedImageValidationPipeline(unittest.TestCase):
         result = self.validator.validate(contours)
         self.assertGreaterEqual(len(contours), 1)
         self.assertFalse(app._canvas.geometry_is_dirty())  # noqa: SLF001
-        self.assertFalse(result.is_valid)
-        self.assertEqual(len(result.open_contours), 1)
+        self.assertTrue(result.is_valid)
 
     def test_adapter_merges_overlapping_holes_before_afm(self) -> None:
         outer = [(0, 0), (30, 0), (30, 30), (0, 30), (0, 0)]
@@ -514,6 +513,43 @@ class TestLoadedImageValidationPipeline(unittest.TestCase):
 
         self.assertGreater(len(mesh.triangles), 0)
         self.assertGreaterEqual(coefficient, 0.0)
+
+    def test_adapter_ignores_shell_like_hole_artifact(self) -> None:
+        outer = [(0, 0), (100, 0), (100, 100), (0, 100), (0, 0)]
+        # Near-duplicate inner contour that should not become a real hole.
+        shell_like_inner = [(2, 2), (98, 2), (98, 98), (2, 98), (2, 2)]
+
+        mesh = Mesh(triangles=[Triangle(Point(0, 0), Point(1, 0), Point(0, 1))])
+        with patch("src.application.services.advancing_front_mesher.AdvancingFrontMesher.generate_with_holes_and_cuts") as generate:
+            generate.return_value = mesh
+
+            self.adapter.run_from_contours([outer, shell_like_inner])
+
+        _boundary, holes, _cuts = generate.call_args.args[-3:]
+        self.assertEqual(len(holes), 0)
+
+    def test_adapter_keeps_real_centered_hole_with_clear_gap(self) -> None:
+        shell = RegionPolygon([Point(0, 0), Point(100, 0), Point(100, 100), Point(0, 100)])
+        real_hole = RegionPolygon([Point(20, 20), Point(80, 20), Point(80, 80), Point(20, 80)])
+        region = ClassifiedRegion(shell=shell, holes=[real_hole])
+
+        holes = self.adapter._collect_shell_holes(region)  # noqa: SLF001
+        self.assertEqual(len(holes), 1)
+
+    def test_adapter_derives_hole_when_classifier_returns_shell_without_holes(self) -> None:
+        outer = [(0, 0), (100, 0), (100, 100), (0, 100), (0, 0)]
+        inner = [(25, 25), (75, 25), (75, 75), (25, 75), (25, 25)]
+
+        shell = RegionPolygon([Point(0, 0), Point(100, 0), Point(100, 100), Point(0, 100)])
+        forced_region = ClassifiedRegion(shell=shell, holes=[])
+        mesh = Mesh(triangles=[Triangle(Point(0, 0), Point(1, 0), Point(0, 1))])
+        with patch.object(self.adapter._region_classifier, "classify", return_value=[forced_region]):  # noqa: SLF001
+            with patch("src.application.services.advancing_front_mesher.AdvancingFrontMesher.generate_with_holes_and_cuts") as generate:
+                generate.return_value = mesh
+                self.adapter.run_from_contours([outer, inner])
+
+        _boundary, holes, _cuts = generate.call_args.args[-3:]
+        self.assertEqual(len(holes), 1)
 
     def test_adapter_adaptive_runtime_settings_relaxes_large_domain(self) -> None:
         settings = self.adapter.preset_settings(TriangulationMode.BALANCED)

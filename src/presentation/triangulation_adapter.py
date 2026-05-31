@@ -22,6 +22,7 @@ from src.infrastructure.processing.stroke_centerline_extractor import (
     detect_stroke_branch_points,
     extract_stroke_centerlines,
 )
+from src.presentation.tri_debug import tri_debug
 from src.presentation.tools import TriangulationMode
 
 
@@ -95,9 +96,21 @@ class TriangulationAdapter:
         raw_contours: list[Contour],
         settings: TriangulationSettings,
     ) -> tuple[Mesh, float]:
+        tri_debug(
+            "tri_adapter.run_with_contours.start",
+            raw_contours=len(raw_contours),
+            target_h=settings.target_edge_length,
+            epsilon=settings.contour_epsilon,
+        )
         closed_contours, open_contours = self._split_closed_and_open_contours(raw_contours, settings.contour_epsilon)
+        tri_debug(
+            "tri_adapter.run_with_contours.split",
+            closed=len(closed_contours),
+            open=len(open_contours),
+        )
         polygons = self._build_polygons(closed_contours, settings.contour_epsilon)
         regions = self._region_classifier.classify(polygons)
+        tri_debug("tri_adapter.run_with_contours.regions", polygons=len(polygons), regions=len(regions))
         if not regions:
             raise ValueError("No closed contour region found for triangulation.")
         valid_region = self._select_valid_region(regions)
@@ -107,6 +120,8 @@ class TriangulationAdapter:
         # Validate-by-shell mode: use only first-level inner contours as holes.
         # Nested contours inside those holes are excluded from triangulation input.
         holes = self._collect_shell_holes(valid_region)
+        contour_derived_holes = self._derive_holes_from_closed_contours(boundary, closed_contours)
+        holes = self._merge_hole_sets(holes, contour_derived_holes)
         holes = self._obstacle_processor.normalize_holes(valid_region.shell, holes)
         boundary = self._optimize_polygon_for_meshing(boundary, settings.target_edge_length, max_points=1400)
         holes = [
@@ -128,6 +143,12 @@ class TriangulationAdapter:
             smoothing_iterations=runtime_settings.smoothing_iterations,
         )
         hole_points = [hole.points for hole in holes]
+        tri_debug(
+            "tri_adapter.run_with_contours.geometry",
+            boundary_points=len(boundary),
+            holes=len(hole_points),
+            cuts=len(cuts),
+        )
         attempted_cuts = [cuts, self._prune_overlapping_collinear_cuts(cuts)]
         if cuts:
             # Last-resort fallback: ignore problematic cuts and keep shell+holes triangulation.
@@ -137,9 +158,19 @@ class TriangulationAdapter:
         for candidate_cuts in attempted_cuts:
             try:
                 mesh = self._mesher.generate_with_holes_and_cuts(boundary, hole_points, candidate_cuts)
+                tri_debug(
+                    "tri_adapter.run_with_contours.mesh_success",
+                    candidate_cuts=len(candidate_cuts),
+                    triangles=len(mesh.triangles),
+                )
                 break
             except ValueError as error:
                 last_error = error
+                tri_debug(
+                    "tri_adapter.run_with_contours.mesh_fail",
+                    candidate_cuts=len(candidate_cuts),
+                    error=str(error),
+                )
                 continue
         if mesh is None:
             if last_error is not None:
@@ -412,15 +443,80 @@ class TriangulationAdapter:
 
         for contour in contours:
             simplified_contour = simplify_contour(contour, epsilon=epsilon)
-            if len(simplified_contour) >= 3 and self._is_closed_contour(contour, simplified_contour, epsilon):
-                closed = simplified_contour
+            candidate = simplified_contour if len(simplified_contour) >= 3 else contour
+            if len(candidate) >= 3 and self._is_closed_contour(contour, candidate, epsilon):
+                closed = candidate
                 if closed[0] != closed[-1]:
                     closed = [*closed, closed[0]]
                 closed_contours.append(closed)
             else:
-                open_contours.append(simplified_contour if len(simplified_contour) >= 2 else contour)
+                open_candidate = simplified_contour if len(simplified_contour) >= 2 else contour
+                open_contours.append(open_candidate)
 
+        closed_contours = self._collapse_outline_pairs(closed_contours)
         return closed_contours, open_contours
+
+    def _collapse_outline_pairs(self, closed_contours: list[Contour]) -> list[Contour]:
+        if len(closed_contours) < 2:
+            return closed_contours
+
+        points_cache: list[list[Point]] = [
+            [Point(float(x), float(y)) for x, y in contour]
+            for contour in closed_contours
+        ]
+        areas = [self._polygon_area(points[:-1] if len(points) >= 2 and points[0] == points[-1] else points) for points in points_cache]
+        keep = [True] * len(closed_contours)
+
+        for outer_idx in range(len(closed_contours)):
+            if not keep[outer_idx]:
+                continue
+            outer_points = points_cache[outer_idx]
+            outer_area = areas[outer_idx]
+            if outer_area <= 1e-6:
+                continue
+
+            child_candidates: list[int] = []
+            for inner_idx in range(len(closed_contours)):
+                if inner_idx == outer_idx or not keep[inner_idx]:
+                    continue
+                probe = self._representative_point(points_cache[inner_idx])
+                if point_in_polygon(probe, outer_points, include_boundary=False):
+                    child_candidates.append(inner_idx)
+
+            if len(child_candidates) != 1:
+                continue
+            inner_idx = child_candidates[0]
+            inner_area = areas[inner_idx]
+            if inner_area >= outer_area:
+                continue
+            ratio = inner_area / outer_area if outer_area > 1e-9 else 0.0
+            if ratio < 0.75:
+                continue
+
+            outer_centroid = self._representative_point(outer_points)
+            inner_centroid = self._representative_point(points_cache[inner_idx])
+            centroid_distance = hypot(outer_centroid.x - inner_centroid.x, outer_centroid.y - inner_centroid.y)
+            if centroid_distance > 6.0:
+                continue
+
+            # Outline pair detected: keep the inner boundary (filled-domain intent),
+            # drop the outer stroke envelope contour.
+            keep[outer_idx] = False
+            tri_debug(
+                "tri_adapter.outline_pair_collapsed",
+                dropped_outer=outer_idx,
+                kept_inner=inner_idx,
+                area_ratio=ratio,
+                centroid_distance=centroid_distance,
+            )
+
+        collapsed = [contour for idx, contour in enumerate(closed_contours) if keep[idx]]
+        tri_debug(
+            "tri_adapter.outline_pair_summary",
+            before=len(closed_contours),
+            after=len(collapsed),
+        )
+        return collapsed
 
     def _is_closed_contour(self, raw_contour: Contour, simplified_contour: Contour, epsilon: float) -> bool:
         if len(simplified_contour) >= 3 and simplified_contour[0] == simplified_contour[-1]:
@@ -483,13 +579,117 @@ class TriangulationAdapter:
 
     def _collect_shell_holes(self, region: ClassifiedRegion) -> list[RegionPolygon]:
         holes: list[RegionPolygon] = []
+        shell_area = self._polygon_area(region.shell.points)
+        shell_center = self._representative_point(region.shell.points)
+        shell_diag = self._polygon_bbox_diagonal(region.shell.points)
         for hole in region.holes:
             if not hole.points:
                 continue
             probe = self._representative_point(hole.points)
             if point_in_polygon(probe, region.shell.points, include_boundary=True):
+                # Ignore stroke-outline artifacts: a "hole" almost as large as shell and
+                # centered at the same place is usually the inner edge of a thick boundary.
+                hole_area = self._polygon_area(hole.points)
+                area_ratio = hole_area / shell_area if shell_area > 1e-9 else 0.0
+                center_dist = hypot(probe.x - shell_center.x, probe.y - shell_center.y)
+                shell_gap = self._boundary_gap_between_polygons(region.shell.points, hole.points)
+                center_ratio = center_dist / shell_diag if shell_diag > 1e-9 else 0.0
+                if area_ratio >= 0.85 and center_ratio <= 0.05 and shell_gap <= 6.0:
+                    tri_debug(
+                        "tri_adapter.drop_shell_like_hole",
+                        shell_area=shell_area,
+                        hole_area=hole_area,
+                        area_ratio=area_ratio,
+                        center_distance=center_dist,
+                        center_ratio=center_ratio,
+                        shell_gap=shell_gap,
+                    )
+                    continue
                 holes.append(hole)
         return holes
+
+    def _derive_holes_from_closed_contours(
+        self,
+        boundary: list[Point],
+        closed_contours: list[Contour],
+    ) -> list[RegionPolygon]:
+        if not boundary or not closed_contours:
+            return []
+
+        shell_area = self._polygon_area(boundary)
+        shell_center = self._representative_point(boundary)
+        shell_diag = self._polygon_bbox_diagonal(boundary)
+        derived: list[RegionPolygon] = []
+
+        for contour in closed_contours:
+            points = [Point(float(x), float(y)) for x, y in contour]
+            if len(points) < 4:
+                continue
+            poly = points[:-1] if points[0] == points[-1] else points
+            if len(poly) < 3:
+                continue
+            probe = self._representative_point(poly)
+            if not point_in_polygon(probe, boundary, include_boundary=False):
+                continue
+
+            # Skip shell-like outline artifacts here as well.
+            area = self._polygon_area(poly)
+            area_ratio = area / shell_area if shell_area > 1e-9 else 0.0
+            center_dist = hypot(probe.x - shell_center.x, probe.y - shell_center.y)
+            center_ratio = center_dist / shell_diag if shell_diag > 1e-9 else 0.0
+            shell_gap = self._boundary_gap_between_polygons(boundary, poly)
+            if area_ratio >= 0.85 and center_ratio <= 0.05 and shell_gap <= 6.0:
+                tri_debug(
+                    "tri_adapter.derived_hole_skip_shell_like",
+                    area_ratio=area_ratio,
+                    center_ratio=center_ratio,
+                    shell_gap=shell_gap,
+                )
+                continue
+
+            derived.append(RegionPolygon(points=poly))
+
+        tri_debug("tri_adapter.derived_holes", count=len(derived))
+        return derived
+
+    def _merge_hole_sets(
+        self,
+        primary: list[RegionPolygon],
+        secondary: list[RegionPolygon],
+    ) -> list[RegionPolygon]:
+        if not secondary:
+            return primary
+        merged = list(primary)
+        seen = {
+            tuple((round(p.x, 3), round(p.y, 3)) for p in hole.points)
+            for hole in primary
+        }
+        for hole in secondary:
+            key = tuple((round(p.x, 3), round(p.y, 3)) for p in hole.points)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(hole)
+        tri_debug("tri_adapter.merge_holes", primary=len(primary), secondary=len(secondary), merged=len(merged))
+        return merged
+
+    def _polygon_bbox_diagonal(self, polygon: list[Point]) -> float:
+        if not polygon:
+            return 0.0
+        xs = [p.x for p in polygon]
+        ys = [p.y for p in polygon]
+        return hypot(max(xs) - min(xs), max(ys) - min(ys))
+
+    def _boundary_gap_between_polygons(self, shell: list[Point], hole: list[Point]) -> float:
+        # Estimate minimal gap by sampling hole vertices to shell edges.
+        min_gap = float("inf")
+        shell_edges = list(zip(shell, [*shell[1:], shell[0]]))
+        for hp in hole:
+            for a, b in shell_edges:
+                dist = self._point_to_segment_distance(hp, a, b)
+                if dist < min_gap:
+                    min_gap = dist
+        return min_gap if min_gap != float("inf") else 0.0
 
     def _representative_point(self, polygon: list[Point]) -> Point:
         if not polygon:
