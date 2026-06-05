@@ -64,29 +64,16 @@ def export_mesh_vtk(mesh: Mesh, output_path: str | Path) -> Path:
 
 
 def _mesh_vertices_faces(mesh: Mesh) -> tuple[list[Point], list[tuple[int, int, int]]]:
-    key_to_index: dict[tuple[float, float], int] = {}
-    vertices: list[Point] = []
+    vertices_by_index: dict[int, Point] = {}
     faces: list[tuple[int, int, int]] = []
 
-    for triangle in mesh.triangles:
-        idx_a = _index_for_point(triangle.a, key_to_index, vertices)
-        idx_b = _index_for_point(triangle.b, key_to_index, vertices)
-        idx_c = _index_for_point(triangle.c, key_to_index, vertices)
+    for triangle in mesh.linear_triangles(key_precision=_KEY_PRECISION):
+        idx_a, idx_b, idx_c = (node_id - 1 for node_id in triangle.node_numbers)
+        point_a, point_b, point_c = triangle.node_coordinates
+        vertices_by_index.setdefault(idx_a, point_a)
+        vertices_by_index.setdefault(idx_b, point_b)
+        vertices_by_index.setdefault(idx_c, point_c)
         faces.append((idx_a, idx_b, idx_c))
 
+    vertices = [vertices_by_index[idx] for idx in range(len(vertices_by_index))]
     return vertices, faces
-
-
-def _index_for_point(
-    point: Point,
-    key_to_index: dict[tuple[float, float], int],
-    vertices: list[Point],
-) -> int:
-    key = (round(point.x, _KEY_PRECISION), round(point.y, _KEY_PRECISION))
-    idx = key_to_index.get(key)
-    if idx is not None:
-        return idx
-    idx = len(vertices)
-    key_to_index[key] = idx
-    vertices.append(point)
-    return idx

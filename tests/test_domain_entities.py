@@ -114,6 +114,44 @@ class TestDomainEntities(unittest.TestCase):
         self.assertAlmostEqual(linear[0].area, 5000.0, places=12)
         self.assertAlmostEqual(linear[0].physical_area, 0.5, places=12)
 
+    def test_mesh_linear_triangles_honors_explicit_node_order(self) -> None:
+        p1 = Point(0.0, 0.0)
+        p2 = Point(1.0, 0.0)
+        p3 = Point(1.0, 1.0)
+        p4 = Point(0.0, 1.0)
+        mesh = Mesh(
+            triangles=[
+                Triangle(a=p1, b=p2, c=p3),
+                Triangle(a=p1, b=p3, c=p4),
+            ],
+            node_order=(p3, p1, p4, p2),
+        )
+
+        linear = mesh.linear_triangles()
+
+        self.assertEqual(linear[0].node_numbers, (2, 4, 1))
+        self.assertEqual(linear[1].node_numbers, (2, 1, 3))
+
+    def test_mesh_builds_indexed_mesh_with_boundary_and_bandwidth(self) -> None:
+        p1 = Point(0.0, 0.0)
+        p2 = Point(1.0, 0.0)
+        p3 = Point(1.0, 1.0)
+        p4 = Point(0.0, 1.0)
+        mesh = Mesh(
+            triangles=[
+                Triangle(a=p1, b=p2, c=p3),
+                Triangle(a=p1, b=p3, c=p4),
+            ],
+            node_order=(p3, p1, p4, p2),
+        )
+
+        indexed = mesh.indexed_mesh(boundary_points=[p1, p2, p3, p4])
+
+        self.assertEqual(indexed.nodes, [(1.0, 1.0), (0.0, 0.0), (0.0, 1.0), (1.0, 0.0)])
+        self.assertEqual(indexed.triangles, [(2, 4, 1), (2, 1, 3)])
+        self.assertEqual(indexed.boundary_nodes, {1, 2, 3, 4})
+        self.assertEqual(indexed.bandwidth, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

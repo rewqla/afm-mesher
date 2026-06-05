@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from math import isfinite
 
+from src.domain.entities.indexed_mesh import IndexedMesh
 from src.domain.entities.linear_triangle import LinearTriangle
 from src.domain.entities.point import Point
 from src.domain.entities.triangle import Triangle
@@ -10,12 +11,16 @@ from src.domain.entities.triangle import Triangle
 class Mesh:
     triangles: list[Triangle]
     meters_per_pixel: float = 1.0
+    node_order: tuple[Point, ...] | None = None
+    indexed_mesh_data: IndexedMesh | None = None
 
     def __post_init__(self) -> None:
         if not self.triangles:
             raise ValueError("Mesh triangles must not be empty.")
         if not _is_positive_finite_number(self.meters_per_pixel):
             raise ValueError("Mesh meters_per_pixel must be a positive finite number.")
+        if self.indexed_mesh_data is not None and not isinstance(self.indexed_mesh_data, IndexedMesh):
+            raise ValueError("Mesh indexed_mesh_data must be an IndexedMesh instance when provided.")
 
     def linear_triangles(self, key_precision: int = 10, meters_per_pixel: float | None = None) -> list[LinearTriangle]:
         if key_precision < 0:
@@ -23,36 +28,83 @@ class Mesh:
         resolved_meters_per_pixel = self.meters_per_pixel if meters_per_pixel is None else meters_per_pixel
         if not _is_positive_finite_number(resolved_meters_per_pixel):
             raise ValueError("meters_per_pixel must be a positive finite number.")
-
-        key_to_node_number: dict[tuple[float, float], int] = {}
-
-        def point_key(point: Point) -> tuple[float, float]:
-            return (round(point.x, key_precision), round(point.y, key_precision))
-
-        def get_node_number(point: Point) -> int:
-            key = point_key(point)
-            node_number = key_to_node_number.get(key)
-            if node_number is not None:
-                return node_number
-            node_number = len(key_to_node_number) + 1
-            key_to_node_number[key] = node_number
-            return node_number
+        indexed_mesh = self.indexed_mesh(key_precision=key_precision)
 
         linear: list[LinearTriangle] = []
-        for triangle_index, triangle in enumerate(self.triangles, start=1):
+        for triangle_index, triangle in enumerate(indexed_mesh.triangles, start=1):
+            node_coordinates = tuple(
+                Point(*indexed_mesh.nodes[node_id - indexed_mesh.index_base])
+                for node_id in triangle
+            )
             linear.append(
                 LinearTriangle(
                     triangle_number=triangle_index,
-                    node_coordinates=(triangle.a, triangle.b, triangle.c),
-                    node_numbers=(
-                        get_node_number(triangle.a),
-                        get_node_number(triangle.b),
-                        get_node_number(triangle.c),
-                    ),
+                    node_coordinates=node_coordinates,
+                    node_numbers=triangle,
                     meters_per_pixel=float(resolved_meters_per_pixel),
                 )
             )
         return linear
+
+    def indexed_mesh(
+        self,
+        boundary_points: list[Point] | None = None,
+        key_precision: int = 10,
+    ) -> IndexedMesh:
+        if key_precision < 0:
+            raise ValueError("key_precision must be >= 0")
+        if boundary_points is None and self.indexed_mesh_data is not None:
+            return self.indexed_mesh_data
+
+        key_to_node_number: dict[tuple[float, float], int] = {}
+        node_coordinates_by_id: dict[int, tuple[float, float]] = {}
+        triangles: list[tuple[int, int, int]] = []
+
+        def point_key(point: Point) -> tuple[float, float]:
+            return (round(point.x, key_precision), round(point.y, key_precision))
+
+        def register_point(point: Point) -> int:
+            key = point_key(point)
+            node_number = key_to_node_number.get(key)
+            if node_number is None:
+                node_number = len(key_to_node_number) + 1
+                key_to_node_number[key] = node_number
+                node_coordinates_by_id[node_number] = (point.x, point.y)
+            return node_number
+
+        if self.node_order is not None:
+            for point in self.node_order:
+                register_point(point)
+
+        for triangle in self.triangles:
+            triangles.append(
+                (
+                    register_point(triangle.a),
+                    register_point(triangle.b),
+                    register_point(triangle.c),
+                )
+            )
+
+        nodes = [node_coordinates_by_id[node_id] for node_id in range(1, len(node_coordinates_by_id) + 1)]
+        boundary_nodes: set[int] = set()
+        if boundary_points is not None:
+            for point in boundary_points:
+                node_id = key_to_node_number.get(point_key(point))
+                if node_id is not None:
+                    boundary_nodes.add(node_id)
+
+        bandwidth = max((max(triangle) - min(triangle) for triangle in triangles), default=0)
+        indexed_mesh = IndexedMesh(
+            nodes=nodes,
+            triangles=triangles,
+            boundary_nodes=boundary_nodes,
+            bandwidth=bandwidth,
+            index_base=1,
+            meters_per_pixel=self.meters_per_pixel,
+        )
+        if boundary_points is None:
+            self.indexed_mesh_data = indexed_mesh
+        return indexed_mesh
 
 
 def _is_positive_finite_number(value: object) -> bool:

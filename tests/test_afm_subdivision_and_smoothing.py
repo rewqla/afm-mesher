@@ -55,6 +55,7 @@ class TestAfmSubdivisionAndSmoothing(unittest.TestCase):
         after_quality = mesh_average_quality(smoothed)
 
         self.assertGreaterEqual(after_quality, before_quality)
+        self.assertIsNotNone(smoothed.node_order)
 
         smoothed_points = {
             (round(t.a.x, 6), round(t.a.y, 6))

@@ -6,6 +6,11 @@ from datetime import datetime
 from math import ceil, sqrt
 from pathlib import Path
 
+from src.application.services.mesh_postprocessing import (
+    laplacian_smooth as postprocess_laplacian_smooth,
+    renumber_nodes_rcm,
+)
+from src.domain.entities.indexed_mesh import IndexedMesh
 from src.domain.entities.mesh import Mesh
 from src.domain.entities.point import Point
 from src.domain.entities.triangle import Triangle
@@ -121,7 +126,8 @@ class AdvancingFrontMesher(IMeshGenerator):
             # Last resort for simple domain: robust ear clipping on outer boundary.
             fallback = self._ear_clip_polygon(polygon, polygon, holes=[], cut_segments=[])
             if fallback:
-                return Mesh(triangles=fallback)
+                fallback_mesh = Mesh(triangles=fallback)
+                return self._apply_rcm_numbering(fallback_mesh, boundary=polygon)
 
         if best_mesh is None:
             if last_error is not None:
@@ -911,39 +917,61 @@ class AdvancingFrontMesher(IMeshGenerator):
         return self._laplacian_smooth(mesh, boundary, iterations)
 
     def _laplacian_smooth(self, mesh: Mesh, boundary: list[Point], iterations: int) -> Mesh:
-        node_positions, triangles, adjacency, node_triangles, boundary_ids = self._build_topology(mesh, boundary)
+        node_positions, triangles, _, _, boundary_ids = self._build_topology(mesh, boundary)
         if not node_positions:
-            return mesh
+            return self._apply_rcm_numbering(mesh)
 
-        internal_ids = [node_id for node_id in node_positions if node_id not in boundary_ids]
-        positions = dict(node_positions)
-
-        for _ in range(iterations):
-            proposed_positions = dict(positions)
-            for node_id in internal_ids:
-                neighbors = adjacency[node_id]
-                if not neighbors:
-                    continue
-
-                avg_x = sum(positions[n].x for n in neighbors) / len(neighbors)
-                avg_y = sum(positions[n].y for n in neighbors) / len(neighbors)
-                proposed = Point(avg_x, avg_y)
-
-                if self._move_preserves_orientation(
-                        node_id=node_id,
-                        proposed=proposed,
-                        positions=proposed_positions,
-                        triangles=triangles,
-                        node_triangles=node_triangles,
-                ):
-                    proposed_positions[node_id] = proposed
-            positions = proposed_positions
-
+        ordered_node_ids = sorted(node_positions)
+        nodes = [(node_positions[node_id].x, node_positions[node_id].y) for node_id in ordered_node_ids]
+        smoothed_nodes = postprocess_laplacian_smooth(nodes, triangles, boundary_ids, iterations=iterations)
+        smoothed_positions = {
+            node_id: Point(*smoothed_nodes[node_id - 1])
+            for node_id in ordered_node_ids
+        }
         smoothed_triangles = [
-            Triangle(positions[a], positions[b], positions[c])
+            Triangle(smoothed_positions[a], smoothed_positions[b], smoothed_positions[c])
             for a, b, c in triangles
         ]
-        return Mesh(triangles=smoothed_triangles)
+        smoothed_mesh = Mesh(triangles=smoothed_triangles, meters_per_pixel=mesh.meters_per_pixel)
+        return self._apply_rcm_numbering(smoothed_mesh, boundary=boundary)
+
+    def _apply_rcm_numbering(self, mesh: Mesh, boundary: list[Point] | None = None) -> Mesh:
+        linear_triangles = mesh.linear_triangles(key_precision=_KEY_PRECISION)
+        node_coordinates_by_id: dict[int, tuple[float, float]] = {}
+        indexed_triangles: list[tuple[int, int, int]] = []
+
+        for linear_triangle in linear_triangles:
+            indexed_triangles.append(linear_triangle.node_numbers)
+            for node_id, point in zip(linear_triangle.node_numbers, linear_triangle.node_coordinates):
+                node_coordinates_by_id.setdefault(node_id, (point.x, point.y))
+
+        ordered_nodes = [node_coordinates_by_id[node_id] for node_id in sorted(node_coordinates_by_id)]
+        rcm_nodes, rcm_triangles, bandwidth = renumber_nodes_rcm(ordered_nodes, indexed_triangles)
+        boundary_nodes: set[int] = set()
+        if boundary is not None:
+            node_lookup = {
+                (round(x, _KEY_PRECISION), round(y, _KEY_PRECISION)): idx
+                for idx, (x, y) in enumerate(rcm_nodes, start=1)
+            }
+            for point in boundary:
+                node_id = node_lookup.get((round(point.x, _KEY_PRECISION), round(point.y, _KEY_PRECISION)))
+                if node_id is not None:
+                    boundary_nodes.add(node_id)
+        _afm_debug("afm.postprocess.rcm", nodes=len(rcm_nodes), bandwidth=bandwidth)
+        indexed_mesh = IndexedMesh(
+            nodes=rcm_nodes,
+            triangles=rcm_triangles,
+            boundary_nodes=boundary_nodes,
+            bandwidth=bandwidth,
+            index_base=1,
+            meters_per_pixel=mesh.meters_per_pixel,
+        )
+        return Mesh(
+            triangles=mesh.triangles,
+            meters_per_pixel=mesh.meters_per_pixel,
+            node_order=tuple(Point(x, y) for x, y in rcm_nodes),
+            indexed_mesh_data=indexed_mesh,
+        )
 
     def _average_mesh_quality(self, mesh: Mesh) -> float:
         qualities = [triangle_quality(t.a, t.b, t.c) for t in mesh.triangles]

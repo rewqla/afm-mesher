@@ -41,6 +41,31 @@ class TestMeshExporter(unittest.TestCase):
             self.assertIn("POINTS 4 float", vtk_text)
             self.assertIn("POLYGONS 2 8", vtk_text)
 
+    def test_exporter_uses_mesh_node_order_for_vertex_order(self) -> None:
+        p00 = Point(0.0, 0.0)
+        p10 = Point(1.0, 0.0)
+        p11 = Point(1.0, 1.0)
+        p01 = Point(0.0, 1.0)
+        mesh = Mesh(
+            triangles=[
+                Triangle(p00, p10, p11),
+                Triangle(p00, p11, p01),
+            ],
+            node_order=(p11, p00, p01, p10),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            obj_path = export_mesh_obj(mesh, tmp_path / "mesh.obj")
+            obj_lines = obj_path.read_text(encoding="utf-8").splitlines()
+
+        vertex_lines = [line for line in obj_lines if line.startswith("v ")]
+        face_lines = [line for line in obj_lines if line.startswith("f ")]
+        self.assertEqual(vertex_lines[0], "v 1.0000000000 1.0000000000 0.0")
+        self.assertEqual(vertex_lines[1], "v 0.0000000000 0.0000000000 0.0")
+        self.assertIn("f 2 4 1", face_lines)
+        self.assertIn("f 2 1 3", face_lines)
+
     def _sample_mesh(self) -> Mesh:
         p00 = Point(0.0, 0.0)
         p10 = Point(1.0, 0.0)
