@@ -1,6 +1,7 @@
 import unittest
 
 import _bootstrap  # noqa: F401
+from src.application.services.advancing_front_mesher import AdvancingFrontMesher
 from src.domain.entities.edge import Edge
 from src.domain.entities.mesh import Mesh
 from src.domain.entities.point import Point
@@ -93,8 +94,10 @@ class TestDomainEntities(unittest.TestCase):
         self.assertEqual(linear[0].triangle_number, 1)
         self.assertEqual(linear[1].triangle_number, 2)
 
-        self.assertEqual(linear[0].node_numbers[1], linear[1].node_numbers[0])
-        self.assertEqual(linear[0].node_numbers[2], linear[1].node_numbers[2])
+        self.assertEqual(
+            {triangle.node_numbers for triangle in linear},
+            {(1, 2, 3), (2, 4, 3)},
+        )
         self.assertEqual(sorted({n for t in linear for n in t.node_numbers}), [1, 2, 3, 4])
 
     def test_mesh_propagates_meters_per_pixel_to_linear_triangles(self) -> None:
@@ -129,8 +132,46 @@ class TestDomainEntities(unittest.TestCase):
 
         linear = mesh.linear_triangles()
 
-        self.assertEqual(linear[0].node_numbers, (2, 4, 1))
-        self.assertEqual(linear[1].node_numbers, (2, 1, 3))
+        self.assertEqual(
+            [(triangle.triangle_number, triangle.node_numbers) for triangle in linear],
+            [(1, (2, 1, 3)), (2, (2, 4, 1))],
+        )
+
+    def test_mesh_linear_triangles_repeat_call_is_idempotent(self) -> None:
+        mesh = Mesh(
+            triangles=[
+                Triangle(a=Point(0.0, 0.0), b=Point(1.0, 0.0), c=Point(0.0, 1.0)),
+                Triangle(a=Point(1.0, 0.0), b=Point(1.0, 1.0), c=Point(0.0, 1.0)),
+            ]
+        )
+
+        first = mesh.linear_triangles()
+        second = mesh.linear_triangles()
+
+        self.assertEqual(
+            [(triangle.triangle_number, triangle.node_numbers) for triangle in first],
+            [(triangle.triangle_number, triangle.node_numbers) for triangle in second],
+        )
+
+    def test_mesh_linear_triangles_after_rcm_repeat_call_is_idempotent(self) -> None:
+        mesher = AdvancingFrontMesher(smoothing_iterations=0)
+        mesh = Mesh(
+            triangles=[
+                Triangle(a=Point(0.0, 0.0), b=Point(2.0, 0.0), c=Point(1.0, 1.0)),
+                Triangle(a=Point(0.0, 0.0), b=Point(1.0, 1.0), c=Point(0.0, 2.0)),
+                Triangle(a=Point(2.0, 0.0), b=Point(2.0, 2.0), c=Point(1.0, 1.0)),
+            ]
+        )
+        boundary = [Point(0.0, 0.0), Point(2.0, 0.0), Point(2.0, 2.0), Point(0.0, 2.0)]
+
+        rcm_mesh = mesher._apply_rcm_numbering(mesh, boundary=boundary)  # noqa: SLF001
+        first = rcm_mesh.linear_triangles()
+        second = rcm_mesh.linear_triangles()
+
+        self.assertEqual(
+            [(triangle.triangle_number, triangle.node_numbers) for triangle in first],
+            [(triangle.triangle_number, triangle.node_numbers) for triangle in second],
+        )
 
     def test_mesh_builds_indexed_mesh_with_boundary_and_bandwidth(self) -> None:
         p1 = Point(0.0, 0.0)

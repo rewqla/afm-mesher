@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite
 
 from src.domain.entities.indexed_mesh import IndexedMesh
@@ -13,6 +13,11 @@ class Mesh:
     meters_per_pixel: float = 1.0
     node_order: tuple[Point, ...] | None = None
     indexed_mesh_data: IndexedMesh | None = None
+    _linear_triangles_cache: dict[tuple[int, float], tuple[LinearTriangle, ...]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if not self.triangles:
@@ -23,11 +28,16 @@ class Mesh:
             raise ValueError("Mesh indexed_mesh_data must be an IndexedMesh instance when provided.")
 
     def linear_triangles(self, key_precision: int = 10, meters_per_pixel: float | None = None) -> list[LinearTriangle]:
+        """Build cached LinearTriangle objects keyed by precision and scale."""
         if key_precision < 0:
             raise ValueError("key_precision must be >= 0")
         resolved_meters_per_pixel = self.meters_per_pixel if meters_per_pixel is None else meters_per_pixel
         if not _is_positive_finite_number(resolved_meters_per_pixel):
             raise ValueError("meters_per_pixel must be a positive finite number.")
+        cache_key = (key_precision, float(resolved_meters_per_pixel))
+        cached = self._linear_triangles_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
         indexed_mesh = self.indexed_mesh(key_precision=key_precision)
 
         linear: list[LinearTriangle] = []
@@ -44,7 +54,13 @@ class Mesh:
                     meters_per_pixel=float(resolved_meters_per_pixel),
                 )
             )
-        return linear
+        # Lazy import to avoid circular dependency: mesh_postprocessing depends on LinearTriangle,
+        # while Mesh imports LinearTriangle at module load time.
+        from src.application.services.mesh_postprocessing import renumber_triangles
+
+        renumbered = tuple(renumber_triangles(linear))
+        self._linear_triangles_cache[cache_key] = renumbered
+        return list(renumbered)
 
     def indexed_mesh(
         self,

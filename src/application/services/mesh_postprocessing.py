@@ -2,11 +2,58 @@ from __future__ import annotations
 
 from collections import deque
 
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - exercised via explicit error path
+    np = None  # type: ignore[assignment]
+
+from src.domain.entities.linear_triangle import LinearTriangle
 from src.domain.entities.point import Point
 from src.domain.geometry.geometry_utils import orientation, triangle_quality
 
 Node = tuple[float, float]
 TriangleIndices = tuple[int, int, int]
+
+_TRIANGLE_KEY_NODE_BITS = 32
+
+
+def renumber_triangles(
+    triangles: list[LinearTriangle],
+) -> list[LinearTriangle]:
+    """Return a new list of LinearTriangles with stable 1-based numbering."""
+    if np is None:
+        raise ImportError("numpy is required for renumber_triangles")
+    if not triangles:
+        return []
+    if len(triangles) == 1:
+        triangle = triangles[0]
+        return [
+            LinearTriangle(
+                triangle_number=1,
+                node_coordinates=triangle.node_coordinates,
+                node_numbers=triangle.node_numbers,
+                meters_per_pixel=triangle.meters_per_pixel,
+            )
+        ]
+
+    keys = np.array(
+        [
+            (min(triangle.node_numbers) << _TRIANGLE_KEY_NODE_BITS) | max(triangle.node_numbers)
+            for triangle in triangles
+        ],
+        dtype=np.uint64,
+    )
+    order = np.argsort(keys, kind="stable")
+
+    return [
+        LinearTriangle(
+            triangle_number=new_number,
+            node_coordinates=triangles[int(index)].node_coordinates,
+            node_numbers=triangles[int(index)].node_numbers,
+            meters_per_pixel=triangles[int(index)].meters_per_pixel,
+        )
+        for new_number, index in enumerate(order, start=1)
+    ]
 
 
 def renumber_nodes_rcm(
