@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.application.services.boundary_validator import BoundaryValidator
+from src.application.services.mesh_postprocessing import compute_max_difference
 from src.domain.entities.mesh import Mesh
 from src.presentation.canvas import Canvas
 from src.presentation.tri_debug import tri_debug
@@ -87,7 +88,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "max_iterations_factor": "Коефіцієнт макс. ітерацій:",
         "min_triangle_quality": "Мін. якість трикутника:",
         "scale_m_per_px": "Масштаб (м/пкс):",
-        "status_tri_done": "Тріангуляцію завершено. коефіцієнт={coefficient:.4f}",
+        "status_tri_done_with_diff": (
+            "Тріангуляцію завершено. коефіцієнт={coefficient:.4f}; "
+            "вузлів={node_count}; макс. різниця вузлів={node_difference}"
+        ),
         "tool_pen": "Перо",
         "tool_eraser": "Ластик",
         "tool_fill": "Заливка",
@@ -130,7 +134,10 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "max_iterations_factor": "Max iterations factor:",
         "min_triangle_quality": "Min triangle quality:",
         "scale_m_per_px": "Scale (m/px):",
-        "status_tri_done": "Triangulation done. coefficient={coefficient:.4f}",
+        "status_tri_done_with_diff": (
+            "Triangulation done. coefficient={coefficient:.4f}; "
+            "nodes={node_count}; max node difference={node_difference}"
+        ),
         "tool_pen": "Pen",
         "tool_eraser": "Eraser",
         "tool_fill": "Fill",
@@ -256,7 +263,15 @@ class PaintApp(QMainWindow):
 
     def display_triangulation_result(self, mesh: Mesh, coefficient: float) -> None:
         self._canvas.set_mesh_overlay(mesh)
-        self.statusBar().showMessage(self._t("status_tri_done").format(coefficient=coefficient))
+        node_difference = self._mesh_node_difference(mesh)
+        node_count = self._mesh_node_count(mesh)
+        self.statusBar().showMessage(
+            self._t("status_tri_done_with_diff").format(
+                coefficient=coefficient,
+                node_count=node_count,
+                node_difference=node_difference,
+            )
+        )
         self._state_status_label.setText(self._t("status_idle"))
 
     def _t(self, key: str) -> str:
@@ -1515,6 +1530,22 @@ class PaintApp(QMainWindow):
         self.setCursor(Qt.CursorShape.WaitCursor if busy else Qt.CursorShape.ArrowCursor)
         if not busy:
             self._update_custom_controls_enabled()
+
+    def _mesh_node_difference(self, mesh: Mesh) -> int:
+        indexed_mesh = mesh.indexed_mesh_data
+        if indexed_mesh is not None:
+            # RCM-postprocessed meshes already store the same maxDifference metric as bandwidth.
+            return indexed_mesh.bandwidth
+        return compute_max_difference(mesh.linear_triangles())
+
+    def _mesh_node_count(self, mesh: Mesh) -> int:
+        indexed_mesh = mesh.indexed_mesh_data
+        if indexed_mesh is not None:
+            return len(indexed_mesh.nodes)
+        node_ids: set[int] = set()
+        for triangle in mesh.linear_triangles():
+            node_ids.update(triangle.node_numbers)
+        return len(node_ids)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._triangulation_busy:

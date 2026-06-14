@@ -1,9 +1,10 @@
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import _bootstrap  # noqa: F401
 import src.application.services.mesh_postprocessing as mesh_postprocessing
-from src.application.services.mesh_postprocessing import renumber_triangles
+from src.application.services.mesh_postprocessing import compute_max_difference, renumber_triangles
 from src.domain.entities.linear_triangle import LinearTriangle
 from src.domain.entities.point import Point
 
@@ -136,6 +137,78 @@ class TestTriangleNumbering(unittest.TestCase):
         self.assertEqual(numbers[0], 1)
         self.assertEqual(numbers[-1], 50_000)
         self.assertEqual(set(numbers), set(range(1, 50_001)))
+
+    def test_compute_max_difference_for_six_triangle_fan_is_six(self) -> None:
+        # This is the expected value for this fixed numbering:
+        # center node = 1, outer nodes = 2..7.
+        triangles = [
+            self._triangle(1, (1, 2, 3)),
+            self._triangle(2, (1, 3, 4)),
+            self._triangle(3, (1, 4, 5)),
+            self._triangle(4, (1, 5, 6)),
+            self._triangle(5, (1, 6, 7)),
+            self._triangle(6, (1, 7, 2)),
+        ]
+
+        self.assertEqual(compute_max_difference(triangles), 6)
+
+    def test_compute_max_difference_finds_max_among_non_first_triangle(self) -> None:
+        # The maximum is 6 here, but it appears in the middle of the list.
+        # This checks that the function evaluates all triangles, not only the first one.
+        triangles = [
+            self._triangle(10, (1, 2, 3)),   # difference = 2
+            self._triangle(20, (3, 9, 5)),    # difference = 6
+            self._triangle(30, (4, 5, 6)),    # difference = 2
+            self._triangle(40, (7, 8, 9)),    # difference = 2
+        ]
+
+        self.assertEqual(compute_max_difference(triangles), 6)
+
+    def test_compute_max_difference_with_multiple_triangles_having_max_difference(self) -> None:
+        """Check that multiple maxima do not affect the returned maximum value."""
+        triangles = [
+            self._triangle(10, (1, 2, 3)),   # difference = 2
+            self._triangle(20, (3, 9, 5)),    # difference = 6
+            self._triangle(30, (4, 5, 6)),    # difference = 2
+            self._triangle(40, (2, 8, 4)),    # difference = 6
+            self._triangle(50, (7, 8, 9)),    # difference = 2
+        ]
+
+        self.assertEqual(compute_max_difference(triangles), 6)
+
+    def test_compute_max_difference_single_triangle(self) -> None:
+        """Check the minimal non-empty case with a single triangle."""
+        triangles = [
+            self._triangle(10, (1, 7, 4)),
+        ]
+
+        self.assertEqual(compute_max_difference(triangles), 6)
+
+    def test_compute_max_difference_all_nodes_equal(self) -> None:
+        """Check that equal node ids produce zero spread instead of an error."""
+        triangles = [SimpleNamespace(node_numbers=(5, 5, 5))]
+
+        self.assertEqual(compute_max_difference(triangles), 0)
+
+    def test_compute_max_difference_empty_triangle_list(self) -> None:
+        """Check the current empty-input behavior, which is a zero result."""
+        self.assertEqual(compute_max_difference([]), 0)
+
+    def test_compute_max_difference_with_unsorted_node_numbers(self) -> None:
+        """Check that node order inside the triangle does not affect the result."""
+        triangles = [
+            self._triangle(10, (9, 2, 5)),
+        ]
+
+        self.assertEqual(compute_max_difference(triangles), 7)
+
+    def test_compute_max_difference_large_node_id_range(self) -> None:
+        """Check that large node ids are handled without overflow or truncation."""
+        triangles = [
+            self._triangle(10, (1, 1_000_000, 2)),
+        ]
+
+        self.assertEqual(compute_max_difference(triangles), 999_999)
 
     def _triangle(
         self,

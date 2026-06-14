@@ -17,6 +17,11 @@ TriangleIndices = tuple[int, int, int]
 _TRIANGLE_KEY_NODE_BITS = 32
 
 
+def compute_max_difference(triangles: list[LinearTriangle]) -> int:
+    """Return the maximum node-number spread inside any triangle."""
+    return _compute_bandwidth([triangle.node_numbers for triangle in triangles])
+
+
 def renumber_triangles(
     triangles: list[LinearTriangle],
 ) -> list[LinearTriangle]:
@@ -297,7 +302,11 @@ def _build_incident_triangles(node_count: int, triangles: list[TriangleIndices])
 
 
 def _compute_bandwidth(triangles: list[TriangleIndices]) -> int:
-    return max((max(triangle) - min(triangle) for triangle in triangles), default=0)
+    return max((_triangle_difference(triangle) for triangle in triangles), default=0)
+
+
+def _triangle_difference(triangle: TriangleIndices) -> int:
+    return max(triangle) - min(triangle)
 
 
 def _move_improves_local_quality(

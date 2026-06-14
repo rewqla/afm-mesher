@@ -176,7 +176,12 @@ class TriangulationAdapter:
             if last_error is not None:
                 raise last_error
             raise ValueError("Triangulation failed.")
-        mesh = Mesh(triangles=mesh.triangles, meters_per_pixel=settings.meters_per_pixel)
+        mesh = Mesh(
+            triangles=mesh.triangles,
+            meters_per_pixel=settings.meters_per_pixel,
+            node_order=mesh.node_order,
+            indexed_mesh_data=mesh.indexed_mesh_data,
+        )
         if not mesh.triangles:
             raise ValueError("Triangulation produced no valid triangles for the selected region.")
         coefficient = mesh_average_quality(mesh)

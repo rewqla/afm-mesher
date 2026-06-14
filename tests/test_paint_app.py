@@ -6,6 +6,10 @@ from PySide6.QtGui import QImage, QMouseEvent
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from src.presentation.paint_app import PaintApp, TRIANGULATION_INFO_DIALOG_TEXT
+from src.domain.entities.indexed_mesh import IndexedMesh
+from src.domain.entities.mesh import Mesh
+from src.domain.entities.point import Point
+from src.domain.entities.triangle import Triangle
 from src.presentation.tools import Tool
 
 
@@ -72,6 +76,39 @@ class TestPaintApp(unittest.TestCase):
         self.assertIsNotNone(ok_button)
         assert ok_button is not None
         self.assertEqual(ok_button.text(), "Продовжити")
+
+    def test_display_triangulation_result_updates_quality_and_node_difference_labels(self) -> None:
+        window = PaintApp()
+        mesh = Mesh(
+            triangles=[
+                Triangle(
+                    a=Point(0.0, 0.0),
+                    b=Point(1.0, 0.0),
+                    c=Point(0.0, 1.0),
+                )
+            ],
+            indexed_mesh_data=IndexedMesh(
+                nodes=[
+                    (0.0, 0.0),
+                    (1.0, 0.0),
+                    (0.0, 1.0),
+                    (0.25, 0.25),
+                    (0.5, 0.5),
+                    (0.75, 0.75),
+                    (1.0, 1.0),
+                ],
+                triangles=[(1, 7, 4)],
+                boundary_nodes=set(),
+                bandwidth=6,
+                index_base=1,
+            ),
+        )
+
+        window.display_triangulation_result(mesh, 0.125)
+
+        self.assertIn("0.1250", window.statusBar().currentMessage())
+        self.assertIn("вузлів=7", window.statusBar().currentMessage())
+        self.assertIn("6", window.statusBar().currentMessage())
 
     def test_branch_detection_is_skipped_for_multiple_contours(self) -> None:
         window = PaintApp()
