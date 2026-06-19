@@ -8,7 +8,10 @@ from pathlib import Path
 
 from src.application.services.mesh_postprocessing import (
     laplacian_smooth as postprocess_laplacian_smooth,
+    renumber_nodes_rcm_multistart,
     renumber_nodes_rcm,
+    renumber_nodes_sloan,
+    renumber_nodes_sloan_multistart,
 )
 from src.domain.entities.indexed_mesh import IndexedMesh
 from src.domain.entities.mesh import Mesh
@@ -54,6 +57,7 @@ class AdvancingFrontMesher(IMeshGenerator):
             max_iterations_factor: int = 500,
             target_edge_length: float | None = None,
             smoothing_iterations: int = 5,
+            numbering_strategy: str = "rcm_multistart",
     ) -> None:
         if not 0.0 <= min_triangle_quality <= 1.0:
             raise ValueError("min_triangle_quality must be in [0, 1]")
@@ -68,6 +72,7 @@ class AdvancingFrontMesher(IMeshGenerator):
         self._max_iterations_factor = max_iterations_factor
         self._target_edge_length = target_edge_length
         self._smoothing_iterations = smoothing_iterations
+        self._numbering_strategy = numbering_strategy
         self._steiner_activation_length_factor = 0.95
         self._debug_progress_interval = 250
 
@@ -935,7 +940,12 @@ class AdvancingFrontMesher(IMeshGenerator):
         smoothed_mesh = Mesh(triangles=smoothed_triangles, meters_per_pixel=mesh.meters_per_pixel)
         return self._apply_rcm_numbering(smoothed_mesh, boundary=boundary)
 
-    def _apply_rcm_numbering(self, mesh: Mesh, boundary: list[Point] | None = None) -> Mesh:
+    def _apply_rcm_numbering(
+        self,
+        mesh: Mesh,
+        boundary: list[Point] | None = None,
+        numbering_strategy: str | None = None,
+    ) -> Mesh:
         linear_triangles = mesh.linear_triangles(key_precision=_KEY_PRECISION)
         node_coordinates_by_id: dict[int, tuple[float, float]] = {}
         indexed_triangles: list[tuple[int, int, int]] = []
@@ -946,7 +956,19 @@ class AdvancingFrontMesher(IMeshGenerator):
                 node_coordinates_by_id.setdefault(node_id, (point.x, point.y))
 
         ordered_nodes = [node_coordinates_by_id[node_id] for node_id in sorted(node_coordinates_by_id)]
-        rcm_nodes, rcm_triangles, bandwidth = renumber_nodes_rcm(ordered_nodes, indexed_triangles)
+        numbering_strategy = self._numbering_strategy if numbering_strategy is None else numbering_strategy
+        if numbering_strategy == "rcm_multistart":
+            rcm_nodes, rcm_triangles, bandwidth = renumber_nodes_rcm_multistart(ordered_nodes, indexed_triangles)
+        elif numbering_strategy == "rcm":
+            rcm_nodes, rcm_triangles, bandwidth = renumber_nodes_rcm(ordered_nodes, indexed_triangles)
+        elif numbering_strategy == "sloan":
+            rcm_nodes, rcm_triangles, bandwidth = renumber_nodes_sloan(ordered_nodes, indexed_triangles)
+        elif numbering_strategy == "sloan_multistart":
+            rcm_nodes, rcm_triangles, bandwidth = renumber_nodes_sloan_multistart(ordered_nodes, indexed_triangles)
+        else:
+            raise ValueError(
+                "numbering_strategy must be one of 'rcm', 'rcm_multistart', 'sloan', or 'sloan_multistart'"
+            )
         boundary_nodes: set[int] = set()
         if boundary is not None:
             node_lookup = {
@@ -957,7 +979,7 @@ class AdvancingFrontMesher(IMeshGenerator):
                 node_id = node_lookup.get((round(point.x, _KEY_PRECISION), round(point.y, _KEY_PRECISION)))
                 if node_id is not None:
                     boundary_nodes.add(node_id)
-        _afm_debug("afm.postprocess.rcm", nodes=len(rcm_nodes), bandwidth=bandwidth)
+        _afm_debug("afm.postprocess.rcm", nodes=len(rcm_nodes), bandwidth=bandwidth, strategy=numbering_strategy)
         indexed_mesh = IndexedMesh(
             nodes=rcm_nodes,
             triangles=rcm_triangles,

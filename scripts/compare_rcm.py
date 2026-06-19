@@ -19,7 +19,12 @@ if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.application.services import advancing_front_mesher as afm_module
-from src.application.services.mesh_postprocessing import _build_node_adjacency, _normalize_triangle_indices, compute_max_difference
+from src.application.services.mesh_postprocessing import (
+    _build_node_adjacency,
+    _normalize_triangle_indices,
+    compute_max_difference,
+    renumber_nodes_rcm_multistart,
+)
 from src.domain.entities.linear_triangle import LinearTriangle
 from src.domain.entities.point import Point
 from src.presentation.tools import TriangulationMode
@@ -34,7 +39,7 @@ def main() -> None:
     if image.isNull():
         raise SystemExit(f"Failed to load image: {image_path}")
 
-    adapter = TriangulationAdapter(threshold=args.threshold)
+    adapter = TriangulationAdapter(threshold=args.threshold, use_multistart_rcm=False)
     settings = _resolve_settings(adapter, args)
     captured: dict[str, object] = {}
 
@@ -72,9 +77,14 @@ def main() -> None:
 
     own_nodes, own_triangles, own_beta = own_result
     own_triangles_one_based = _to_one_based([tuple(triangle) for triangle in own_triangles], index_base)
+    multistart_nodes, multistart_triangles, multistart_beta = renumber_nodes_rcm_multistart(
+        raw_nodes_typed,
+        raw_triangles_typed,
+    )
     scipy_nodes, scipy_triangles = _apply_permutation(raw_nodes_typed, normalized_triangles, scipy_perm)
 
     own_beta_check = compute_max_difference(_build_linear_triangles(own_nodes, own_triangles_one_based))
+    multistart_beta_check = compute_max_difference(_build_linear_triangles(multistart_nodes, multistart_triangles))
     scipy_beta = compute_max_difference(_build_linear_triangles(scipy_nodes, scipy_triangles))
 
     degrees = [len(neighbors) for neighbors in adjacency]
@@ -88,10 +98,12 @@ def main() -> None:
     print(f"raw_graph nodes={len(raw_nodes_typed)} triangles={len(raw_triangles_typed)} adjacency=list[set[int]]")
     print(f"own_start_node={own_start + index_base} own_start_degree={degrees[own_start]}")
     print(f"own_perm_first_node={own_perm_ids[0] if own_perm_ids else None}")
+    print(f"multistart_beta={multistart_beta} multistart_beta_via_compute_max_difference={multistart_beta_check}")
     print(f"scipy_perm_first_node={scipy_perm_ids[0] if scipy_perm_ids else None}")
     print(f"own_beta={own_beta} own_beta_via_compute_max_difference={own_beta_check}")
     print(f"scipy_beta={scipy_beta}")
     print(f"delta={own_beta - scipy_beta}")
+    print(f"delta_multistart={own_beta - multistart_beta}")
     print(f"mesh_average_quality={coefficient}")
     print(f"mesh_indexed_bandwidth={mesh.indexed_mesh_data.bandwidth if mesh.indexed_mesh_data else None}")
 
