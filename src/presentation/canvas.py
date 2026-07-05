@@ -34,6 +34,7 @@ class Canvas(QWidget):
         self._undo_stack: list[QImage] = []
         self._redo_stack: list[QImage] = []
         self._geometry_contours: list[list[tuple[float, float]]] = []
+        self._geometry_overlay_enabled = False
         self._filled_contour_keys: set[tuple[tuple[float, float], ...]] = set()
         self._invalid_segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
         self._invalid_points: list[tuple[float, float]] = []
@@ -65,6 +66,7 @@ class Canvas(QWidget):
         self._filled_contour_keys.clear()
         self._invalid_segments.clear()
         self._invalid_points.clear()
+        self._geometry_overlay_enabled = False
         self._geometry_dirty = False
         self._mesh_overlay = None
         self.update()
@@ -79,6 +81,7 @@ class Canvas(QWidget):
         self._filled_contour_keys.clear()
         self._invalid_segments.clear()
         self._invalid_points.clear()
+        self._geometry_overlay_enabled = False
         self._geometry_dirty = False
         self._mesh_overlay = None
         self.setMinimumSize(converted.width(), converted.height())
@@ -161,6 +164,7 @@ class Canvas(QWidget):
         for contour in contours:
             self._store_contour(contour, preprocess=preprocess)
         self._geometry_dirty = False
+        self._geometry_overlay_enabled = not redraw_image
         if redraw_image:
             self._redraw_geometry_layer()
         self.update()
@@ -372,6 +376,8 @@ class Canvas(QWidget):
 
         if self._drawing and self._tool in (Tool.SEGMENT, Tool.RECTANGLE, Tool.CIRCLE):
             self._draw_shape_preview(painter)
+        if self._geometry_overlay_enabled:
+            self._draw_geometry_contours(painter)
         if self._invalid_segments:
             self._draw_invalid_segments(painter)
         if self._invalid_points:
@@ -516,6 +522,29 @@ class Canvas(QWidget):
         for x, y in self._invalid_points:
             center = QPoint(int(round(x)), int(round(y)))
             painter.drawEllipse(center, 7, 7)
+
+    def _draw_geometry_contours(self, painter: QPainter) -> None:
+        first_closed_drawn = False
+        for contour in self._geometry_contours:
+            if len(contour) < 2:
+                continue
+            is_closed = self._contour_is_closed(contour)
+            if is_closed and not first_closed_drawn:
+                pen = QPen(QColor("#2563eb"), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+                first_closed_drawn = True
+            elif is_closed:
+                pen = QPen(QColor("#16a34a"), 2, Qt.PenStyle.DashLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            else:
+                pen = QPen(QColor("#dc2626"), 1, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for i in range(len(contour) - 1):
+                x1, y1 = contour[i]
+                x2, y2 = contour[i + 1]
+                painter.drawLine(
+                    QPoint(int(round(x1)), int(round(y1))),
+                    QPoint(int(round(x2)), int(round(y2))),
+                )
 
     def _in_bounds(self, point: QPoint) -> bool:
         return 0 <= point.x() < self._image.width() and 0 <= point.y() < self._image.height()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Callable
@@ -215,6 +216,7 @@ class PaintApp(QMainWindow):
         self._triangulation_worker: TriangulationWorker | None = None
         self._triangulation_busy = False
         self._triangulation_mode = TriangulationMode.BALANCED
+        self._last_inclusion_types: dict[int, str] = {}
         self._current_tool = Tool.PEN
         self._tool_status_label = QLabel("Tool: Pen")
         self._state_status_label = QLabel("Idle")
@@ -404,8 +406,8 @@ class PaintApp(QMainWindow):
         command_handlers: dict[str, tuple[str, Callable[[], None]]] = {
             "Undo": ("Undo last action", self._on_undo),
             "Redo": ("Redo last action", self._on_redo),
-            "Save": ("Save image to PNG/JPG", self._on_save),
-            "Load": ("Load image from PNG/JPG", self._on_load),
+            "Save": ("Зберегти зображення у PNG/JPG", self._on_save),
+            "Load": ("Завантажити зображення або координати з файлу", self._on_load),
             "Info": ("Show triangulation info", self.show_triangulation_info_dialog),
             "Triangulation": ("Run triangulation", self._on_triangulation),
             "Clear": ("Clear canvas", self._canvas.clear),
@@ -1202,7 +1204,7 @@ class PaintApp(QMainWindow):
     def _on_save(self) -> None:
         path, selected_filter = QFileDialog.getSaveFileName(
             self,
-            "Save Canvas",
+            "Зберегти полотно",
             str(Path.cwd() / "mask.png"),
             "PNG Image (*.png);;JPEG Image (*.jpg *.jpeg)",
         )
@@ -1211,27 +1213,101 @@ class PaintApp(QMainWindow):
         image = self._canvas.image_data()
         image_format = "PNG" if "PNG" in selected_filter else "JPEG"
         if not image.save(path, image_format):
-            QMessageBox.critical(self, "Save Error", "Failed to save image.")
+            QMessageBox.critical(self, "Помилка збереження", "Не вдалося зберегти зображення.")
             return
-        self.statusBar().showMessage(f"Saved: {path}")
+        self.statusBar().showMessage(f"Зображення збережено: {path}")
 
     def _on_load(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
+        path, selected_filter = QFileDialog.getOpenFileName(
             self,
-            "Load Image",
+            "Завантажити файл",
             str(Path.cwd()),
-            "Images (*.png *.jpg *.jpeg)",
+            "Підтримувані файли (*.png *.jpg *.jpeg *.json);;JSON файли (*.json);;Зображення (*.png *.jpg *.jpeg);;Всі файли (*)",
         )
         if not path:
             return
+        self._canvas.clear()
+        self._last_inclusion_types = {}
+        is_json = Path(path).suffix.lower() == ".json" or "JSON" in selected_filter
+        if is_json:
+            from src.infrastructure.io.coordinate_json_importer import CoordinateJsonImporter
+
+            importer = CoordinateJsonImporter()
+            try:
+                imported = importer.load(path)
+            except (ValueError, KeyError, json.JSONDecodeError) as exc:
+                QMessageBox.critical(
+                    self,
+                    "Помилка завантаження координат",
+                    f"Не вдалося прочитати файл:\n{exc}",
+                )
+                return
+            contours = self._fit_contours_to_canvas(importer.to_canvas_contours(imported))
+            self._canvas.set_geometry_contours(
+                contours,
+                preprocess=False,
+                redraw_image=False,
+                emit_change=True,
+            )
+            self._canvas.update()
+            self._last_inclusion_types = {
+                1 + i: inc_type
+                for i, (_, inc_type) in enumerate(imported.inclusions)
+            }
+            QMessageBox.information(
+                self,
+                "Координати завантажено",
+                f"Імпортовано:\n"
+                f"  Основна область: {len(imported.outer_boundary)} вершин\n"
+                f"  Включень: {len(imported.inclusions)}\n"
+                f"  Розрізів: {len(imported.cuts)}",
+            )
+            self.statusBar().showMessage(f"Координати імпортовано: {path}")
+            return
         image = QImage(path)
         if image.isNull():
-            QMessageBox.critical(self, "Load Error", "Failed to load image.")
+            QMessageBox.critical(self, "Помилка завантаження", "Не вдалося завантажити зображення.")
             return
         binary = Canvas.binarize_image(image, threshold=127)
         self._canvas.set_image(binary)
         self._refresh_geometry_from_canvas_image(binary, prefer_strokes=True)
-        self.statusBar().showMessage(f"Loaded: {path}")
+        self.statusBar().showMessage(f"Зображення завантажено: {path}")
+
+    def _fit_contours_to_canvas(
+        self,
+        contours: list[list[tuple[float, float]]],
+        padding: int = 40,
+    ) -> list[list[tuple[float, float]]]:
+        all_pts = [pt for contour in contours for pt in contour]
+        if not all_pts:
+            return contours
+        xs = [point[0] for point in all_pts]
+        ys = [point[1] for point in all_pts]
+        min_x = min(xs)
+        max_x = max(xs)
+        min_y = min(ys)
+        max_y = max(ys)
+
+        available_width = max(1.0, float(self._canvas.width() - 2 * padding))
+        available_height = max(1.0, float(self._canvas.height() - 2 * padding))
+        src_width = max_x - min_x
+        src_height = max_y - min_y
+        scale_x = available_width / src_width if src_width > 0 else 1.0
+        scale_y = available_height / src_height if src_height > 0 else 1.0
+        scale = min(scale_x, scale_y)
+
+        scaled_width = src_width * scale
+        scaled_height = src_height * scale
+        offset_x = padding + max(0.0, (available_width - scaled_width) * 0.5)
+        offset_y = padding + max(0.0, (available_height - scaled_height) * 0.5)
+
+        def transform(point: tuple[float, float]) -> tuple[float, float]:
+            x, y = point
+            tx = offset_x + (x - min_x) * scale if src_width > 0 else float(self._canvas.width()) * 0.5
+            ty = offset_y + (y - min_y) * scale if src_height > 0 else float(self._canvas.height()) * 0.5
+            return (tx, ty)
+
+        return [[transform(point) for point in contour] for contour in contours]
 
     def _on_undo(self) -> None:
         if self._triangulation_busy:
