@@ -56,6 +56,7 @@ class TriangulationAdapter:
     MAX_METERS_PER_PIXEL: ClassVar[float] = 1e6
 
     threshold: int = 127
+    numbering_strategy: str = "rcm_multistart"
     _mesher: AdvancingFrontMesher = field(init=False, repr=False)
     _boundary_detection: BoundaryDetectionService = field(init=False, repr=False)
     _region_classifier: RegionClassifier = field(init=False, repr=False)
@@ -67,6 +68,7 @@ class TriangulationAdapter:
             max_iterations_factor=180,
             target_edge_length=24.0,
             smoothing_iterations=2,
+            numbering_strategy=self.numbering_strategy,
         )
         self._boundary_detection = BoundaryDetectionService(PolygonBuilder())
         self._region_classifier = RegionClassifier()
@@ -141,6 +143,7 @@ class TriangulationAdapter:
             max_iterations_factor=runtime_settings.max_iterations_factor,
             target_edge_length=runtime_settings.target_edge_length,
             smoothing_iterations=runtime_settings.smoothing_iterations,
+            numbering_strategy=self.numbering_strategy,
         )
         hole_points = [hole.points for hole in holes]
         tri_debug(
