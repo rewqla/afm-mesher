@@ -107,7 +107,7 @@ class AdvancingFrontMesher(IMeshGenerator):
         for target_scale in attempt_scales:
             target_h = base_h * target_scale
             try:
-                mesh, fixed_boundaries, pass_cut_segments = self._generate_single_pass(
+                mesh, outer_boundary_points, interface_points, pass_cut_segments = self._generate_single_pass(
                     polygon,
                     hole_polygons,
                     cut_segments,
@@ -117,7 +117,12 @@ class AdvancingFrontMesher(IMeshGenerator):
                 last_error = error
                 continue
 
-            mesh = self.smooth(mesh, boundary=fixed_boundaries, iterations=self._smoothing_iterations)
+            mesh = self.smooth(
+                mesh,
+                boundary=outer_boundary_points,
+                interface_points=interface_points,
+                iterations=self._smoothing_iterations,
+            )
             self._validate_cut_segments_are_mesh_edges(mesh, pass_cut_segments)
             avg_quality = self._average_mesh_quality(mesh)
 
@@ -132,7 +137,7 @@ class AdvancingFrontMesher(IMeshGenerator):
             fallback = self._ear_clip_polygon(polygon, polygon, holes=[], cut_segments=[])
             if fallback:
                 fallback_mesh = Mesh(triangles=fallback)
-                return self._apply_rcm_numbering(fallback_mesh, boundary=polygon)
+                return self._apply_rcm_numbering(fallback_mesh, boundary=polygon, interface_points=[])
 
         if best_mesh is None:
             if last_error is not None:
@@ -146,7 +151,7 @@ class AdvancingFrontMesher(IMeshGenerator):
             holes: list[list[Point]],
             cut_segments: list[Segment],
             target_h: float,
-    ) -> tuple[Mesh, list[Point], list[Segment]]:
+    ) -> tuple[Mesh, list[Point], list[Point], list[Segment]]:
         polygon = self._subdivide_boundary(polygon, target_h)
         holes = [self._subdivide_boundary(hole, target_h) for hole in holes]
         pass_cut_segments = self._subdivide_cut_segments(cut_segments, target_h)
@@ -213,14 +218,17 @@ class AdvancingFrontMesher(IMeshGenerator):
         if not triangles:
             raise ValueError("AFM failed to generate mesh.")
 
-        fixed_boundary = [*polygon]
+        outer_boundary_points = [*polygon]
+        interface_points: list[Point] = []
         for hole in holes:
-            fixed_boundary.extend(hole)
+            interface_points.extend(hole)
         for a, b in pass_cut_segments:
-            fixed_boundary.append(a)
-            fixed_boundary.append(b)
+            # Cuts are internal constrained segments. They are fixed like inclusion
+            # boundaries, so they are tracked as interface nodes rather than outer boundary.
+            interface_points.append(a)
+            interface_points.append(b)
         _afm_debug("afm.single_pass.done", triangles=len(triangles))
-        return Mesh(triangles=triangles), fixed_boundary, pass_cut_segments
+        return Mesh(triangles=triangles), outer_boundary_points, interface_points, pass_cut_segments
 
     def _log_stall_diagnostics(
             self,
@@ -918,17 +926,39 @@ class AdvancingFrontMesher(IMeshGenerator):
     def _share_endpoint(self, e1: FrontEdge, e2: FrontEdge) -> bool:
         return e1[0] == e2[0] or e1[0] == e2[1] or e1[1] == e2[0] or e1[1] == e2[1]
 
-    def smooth(self, mesh: Mesh, boundary: list[Point], iterations: int = 5) -> Mesh:
-        return self._laplacian_smooth(mesh, boundary, iterations)
+    def smooth(
+            self,
+            mesh: Mesh,
+            boundary: list[Point],
+            interface_points: list[Point] | None = None,
+            iterations: int = 5,
+    ) -> Mesh:
+        return self._laplacian_smooth(mesh, boundary, interface_points or [], iterations)
 
-    def _laplacian_smooth(self, mesh: Mesh, boundary: list[Point], iterations: int) -> Mesh:
-        node_positions, triangles, _, _, boundary_ids = self._build_topology(mesh, boundary)
+    def _laplacian_smooth(
+            self,
+            mesh: Mesh,
+            boundary: list[Point],
+            interface_points: list[Point],
+            iterations: int,
+    ) -> Mesh:
+        node_positions, triangles, _, _, boundary_ids, interface_ids = self._build_topology(
+            mesh,
+            boundary,
+            interface_points,
+        )
         if not node_positions:
             return self._apply_rcm_numbering(mesh)
 
         ordered_node_ids = sorted(node_positions)
         nodes = [(node_positions[node_id].x, node_positions[node_id].y) for node_id in ordered_node_ids]
-        smoothed_nodes = postprocess_laplacian_smooth(nodes, triangles, boundary_ids, iterations=iterations)
+        smoothed_nodes = postprocess_laplacian_smooth(
+            nodes,
+            triangles,
+            boundary_ids,
+            interface_nodes=interface_ids,
+            iterations=iterations,
+        )
         smoothed_positions = {
             node_id: Point(*smoothed_nodes[node_id - 1])
             for node_id in ordered_node_ids
@@ -938,12 +968,17 @@ class AdvancingFrontMesher(IMeshGenerator):
             for a, b, c in triangles
         ]
         smoothed_mesh = Mesh(triangles=smoothed_triangles, meters_per_pixel=mesh.meters_per_pixel)
-        return self._apply_rcm_numbering(smoothed_mesh, boundary=boundary)
+        return self._apply_rcm_numbering(
+            smoothed_mesh,
+            boundary=boundary,
+            interface_points=interface_points,
+        )
 
     def _apply_rcm_numbering(
         self,
         mesh: Mesh,
         boundary: list[Point] | None = None,
+        interface_points: list[Point] | None = None,
         numbering_strategy: str | None = None,
     ) -> Mesh:
         linear_triangles = mesh.linear_triangles(key_precision=_KEY_PRECISION)
@@ -970,20 +1005,27 @@ class AdvancingFrontMesher(IMeshGenerator):
                 "numbering_strategy must be one of 'rcm', 'rcm_multistart', 'sloan', or 'sloan_multistart'"
             )
         boundary_nodes: set[int] = set()
+        interface_nodes: set[int] = set()
+        node_lookup = {
+            (round(x, _KEY_PRECISION), round(y, _KEY_PRECISION)): idx
+            for idx, (x, y) in enumerate(rcm_nodes, start=1)
+        }
         if boundary is not None:
-            node_lookup = {
-                (round(x, _KEY_PRECISION), round(y, _KEY_PRECISION)): idx
-                for idx, (x, y) in enumerate(rcm_nodes, start=1)
-            }
             for point in boundary:
                 node_id = node_lookup.get((round(point.x, _KEY_PRECISION), round(point.y, _KEY_PRECISION)))
                 if node_id is not None:
                     boundary_nodes.add(node_id)
+        if interface_points is not None:
+            for point in interface_points:
+                node_id = node_lookup.get((round(point.x, _KEY_PRECISION), round(point.y, _KEY_PRECISION)))
+                if node_id is not None:
+                    interface_nodes.add(node_id)
         _afm_debug("afm.postprocess.rcm", nodes=len(rcm_nodes), bandwidth=bandwidth, strategy=numbering_strategy)
         indexed_mesh = IndexedMesh(
             nodes=rcm_nodes,
             triangles=rcm_triangles,
             boundary_nodes=boundary_nodes,
+            interface_nodes=interface_nodes,
             bandwidth=bandwidth,
             index_base=1,
             meters_per_pixel=mesh.meters_per_pixel,
@@ -1141,11 +1183,13 @@ class AdvancingFrontMesher(IMeshGenerator):
             self,
             mesh: Mesh,
             boundary: list[Point],
+            interface_points: list[Point] | None = None,
     ) -> tuple[
         dict[int, Point],
         list[TriangleIds],
         dict[int, set[int]],
         dict[int, list[int]],
+        set[int],
         set[int],
     ]:
         linear_triangles = mesh.linear_triangles(key_precision=_KEY_PRECISION)
@@ -1192,7 +1236,14 @@ class AdvancingFrontMesher(IMeshGenerator):
             if node_id is not None:
                 boundary_ids.add(node_id)
 
-        return positions, triangles, adjacency, node_triangles, boundary_ids
+        interface_ids: set[int] = set()
+        for point in interface_points or []:
+            key = self._point_key(point)
+            node_id = key_to_id.get(key)
+            if node_id is not None:
+                interface_ids.add(node_id)
+
+        return positions, triangles, adjacency, node_triangles, boundary_ids, interface_ids
 
     def _move_preserves_orientation(
             self,

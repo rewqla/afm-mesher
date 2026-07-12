@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite
+
+from src.domain.entities.node_type import NodeType
 
 
 @dataclass(slots=True)
@@ -10,6 +12,7 @@ class IndexedMesh:
     triangles: list[tuple[int, int, int]]
     boundary_nodes: set[int]
     bandwidth: int
+    interface_nodes: set[int] = field(default_factory=set)
     index_base: int = 1
     meters_per_pixel: float = 1.0
 
@@ -32,6 +35,17 @@ class IndexedMesh:
 
         if any(node_id not in node_ids for node_id in self.boundary_nodes):
             raise ValueError("IndexedMesh boundary node indices are out of bounds.")
+        if any(node_id not in node_ids for node_id in self.interface_nodes):
+            raise ValueError("IndexedMesh interface node indices are out of bounds.")
+
+    def node_type(self, node_id: int) -> NodeType:
+        if node_id in self.interface_nodes:
+            # INTERFACE wins over BOUNDARY on collisions because it is the more
+            # specific classification for internal constrained/interface nodes.
+            return NodeType.INTERFACE
+        if node_id in self.boundary_nodes:
+            return NodeType.BOUNDARY
+        return NodeType.INTERIOR
 
 
 def _is_positive_finite_number(value: object) -> bool:

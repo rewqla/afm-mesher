@@ -65,11 +65,12 @@ class Mesh:
     def indexed_mesh(
         self,
         boundary_points: list[Point] | None = None,
+        interface_points: list[Point] | None = None,
         key_precision: int = 10,
     ) -> IndexedMesh:
         if key_precision < 0:
             raise ValueError("key_precision must be >= 0")
-        if boundary_points is None and self.indexed_mesh_data is not None:
+        if boundary_points is None and interface_points is None and self.indexed_mesh_data is not None:
             return self.indexed_mesh_data
 
         key_to_node_number: dict[tuple[float, float], int] = {}
@@ -103,22 +104,29 @@ class Mesh:
 
         nodes = [node_coordinates_by_id[node_id] for node_id in range(1, len(node_coordinates_by_id) + 1)]
         boundary_nodes: set[int] = set()
+        interface_nodes: set[int] = set()
         if boundary_points is not None:
             for point in boundary_points:
                 node_id = key_to_node_number.get(point_key(point))
                 if node_id is not None:
                     boundary_nodes.add(node_id)
+        if interface_points is not None:
+            for point in interface_points:
+                node_id = key_to_node_number.get(point_key(point))
+                if node_id is not None:
+                    interface_nodes.add(node_id)
 
         bandwidth = max((max(triangle) - min(triangle) for triangle in triangles), default=0)
         indexed_mesh = IndexedMesh(
             nodes=nodes,
             triangles=triangles,
             boundary_nodes=boundary_nodes,
+            interface_nodes=interface_nodes,
             bandwidth=bandwidth,
             index_base=1,
             meters_per_pixel=self.meters_per_pixel,
         )
-        if boundary_points is None:
+        if boundary_points is None and interface_points is None:
             self.indexed_mesh_data = indexed_mesh
         return indexed_mesh
 

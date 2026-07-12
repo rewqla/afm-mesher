@@ -374,6 +374,7 @@ def laplacian_smooth(
     nodes: list[tuple[float, float]],
     triangles: list[tuple[int, int, int]],
     boundary_nodes: set[int],
+    interface_nodes: set[int] | None = None,
     iterations: int = 10,
     alpha: float = 0.5,
     tolerance: float = 1e-6,
@@ -391,11 +392,13 @@ def laplacian_smooth(
 
     normalized_triangles, index_base = _normalize_triangle_indices(triangles, len(nodes))
     normalized_boundary = _normalize_boundary_indices(boundary_nodes, len(nodes), index_base)
+    normalized_interface = _normalize_boundary_indices(interface_nodes or set(), len(nodes), index_base)
+    fixed_nodes = normalized_boundary | normalized_interface
     adjacency = _build_node_adjacency(len(nodes), normalized_triangles)
     incident_triangles = _build_incident_triangles(len(nodes), normalized_triangles)
 
     positions = [Point(float(x), float(y)) for x, y in nodes]
-    internal_nodes = [node_id for node_id in range(len(nodes)) if node_id not in normalized_boundary]
+    internal_nodes = [node_id for node_id in range(len(nodes)) if node_id not in fixed_nodes]
 
     for _ in range(iterations):
         proposed_positions = list(positions)

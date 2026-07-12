@@ -99,6 +99,7 @@ class TestPaintApp(unittest.TestCase):
                 ],
                 triangles=[(1, 7, 4)],
                 boundary_nodes=set(),
+                interface_nodes=set(),
                 bandwidth=6,
                 index_base=1,
             ),

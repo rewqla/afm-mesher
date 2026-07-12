@@ -694,7 +694,7 @@ class TestAdvancingFrontMesher(unittest.TestCase):
         )
         boundary = [Point(0.0, 0.0), Point(1.0, 0.0), Point(1.0, 1.0), Point(0.0, 1.0)]
 
-        positions, triangles, _, _, _ = self.mesher._build_topology(mesh, boundary)
+        positions, triangles, _, _, _, _ = self.mesher._build_topology(mesh, boundary)
 
         self.assertEqual(sorted(positions.keys()), [1, 2, 3, 4])
         self.assertEqual(triangles[0][1], triangles[1][0])
@@ -718,7 +718,10 @@ class TestAdvancingFrontMesher(unittest.TestCase):
             patch.object(
                 mesher,
                 "_generate_single_pass",
-                side_effect=[ValueError("AFM stalled: active front cannot be advanced further."), (fake_mesh, boundary, [])],
+                side_effect=[
+                    ValueError("AFM stalled: active front cannot be advanced further."),
+                    (fake_mesh, boundary, [], []),
+                ],
             ) as generate_single_pass,
             patch.object(mesher, "_validate_cut_segments_are_mesh_edges", return_value=None),
         ):
