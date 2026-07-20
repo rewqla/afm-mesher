@@ -8,11 +8,26 @@ from src.domain.entities.triangle import Triangle
 
 
 @dataclass(slots=True)
+class MeshSourceContours:
+    """Original coordinate-import contours for round-trip export.
+
+    This provenance is available only when the mesh is built from imported
+    coordinate JSON. Hand-drawn canvas geometry does not preserve inclusion
+    types separately from generic closed/open contours.
+    """
+
+    outer_boundary: list[tuple[float, float]]
+    inclusions: list[tuple[list[tuple[float, float]], str]]
+    cuts: list[list[tuple[float, float]]]
+
+
+@dataclass(slots=True)
 class Mesh:
     triangles: list[Triangle]
     meters_per_pixel: float = 1.0
     node_order: tuple[Point, ...] | None = None
     indexed_mesh_data: IndexedMesh | None = None
+    source_contours: MeshSourceContours | None = None
     _linear_triangles_cache: dict[tuple[int, float], tuple[LinearTriangle, ...]] = field(
         default_factory=dict,
         init=False,

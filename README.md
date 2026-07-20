@@ -128,9 +128,6 @@ python src/main.py --mode batch
 - будує сітки,
 - зберігає дебаг-візуалізації (`*_debug.png`),
 - експортує `obj/ply/vtk`,
-- генерує звіти:
-  - `data/output/mesh_quality_report.json`,
-  - `data/output/mesh_benchmark_report.csv`.
 
 ### 2) UI режим
 Команда:

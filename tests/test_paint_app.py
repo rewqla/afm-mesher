@@ -1,12 +1,15 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 import _bootstrap  # noqa: F401
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QImage, QMouseEvent
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from src.presentation.paint_app import PaintApp, TRIANGULATION_INFO_DIALOG_TEXT
 from src.domain.entities.indexed_mesh import IndexedMesh
+from src.domain.entities.linear_triangle import LinearTriangle
 from src.domain.entities.mesh import Mesh
 from src.domain.entities.point import Point
 from src.domain.entities.triangle import Triangle
@@ -110,6 +113,49 @@ class TestPaintApp(unittest.TestCase):
         self.assertIn("0.1250", window.statusBar().currentMessage())
         self.assertIn("вузлів=7", window.statusBar().currentMessage())
         self.assertIn("6", window.statusBar().currentMessage())
+
+    def test_save_writes_available_result_files_from_one_dialog(self) -> None:
+        window = PaintApp()
+        p1 = Point(0.0, 0.0)
+        p2 = Point(1.0, 0.0)
+        p3 = Point(0.0, 1.0)
+        mesh = Mesh(
+            triangles=[Triangle(p1, p2, p3)],
+            indexed_mesh_data=IndexedMesh(
+                nodes=[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+                triangles=[(1, 2, 3)],
+                boundary_nodes={1, 2, 3},
+                interface_nodes=set(),
+                bandwidth=2,
+                index_base=1,
+            ),
+        )
+        mesh._linear_triangles_cache[(10, 1.0)] = (  # noqa: SLF001
+            LinearTriangle(1, (p1, p2, p3), (1, 2, 3)),
+        )
+        window.display_triangulation_result(mesh, 1.0)
+
+        original_get_save_file_name = QFileDialog.getSaveFileName
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp) / "mesh.png"
+                QFileDialog.getSaveFileName = lambda *_args, **_kwargs: (str(base), "PNG Image (*.png)")
+
+                window._on_save()  # noqa: SLF001
+
+                self.assertTrue((Path(tmp) / "mesh.png").exists())
+                self.assertTrue((Path(tmp) / "mesh_triangulation.png").exists())
+                self.assertTrue((Path(tmp) / "mesh_triangles.json").exists())
+                self.assertTrue((Path(tmp) / "mesh_nodes.json").exists())
+                self.assertTrue((Path(tmp) / "mesh_stats.json").exists())
+                self.assertFalse((Path(tmp) / "mesh_coordinates.json").exists())
+        finally:
+            QFileDialog.getSaveFileName = original_get_save_file_name
+
+    def test_default_results_base_name_uses_timestamp_pattern(self) -> None:
+        name = PaintApp._default_results_base_name()  # noqa: SLF001
+
+        self.assertRegex(name, r"^mesh_\d{4}-\d{2}-\d{2}_\d{4}$")
 
     def test_branch_detection_is_skipped_for_multiple_contours(self) -> None:
         window = PaintApp()

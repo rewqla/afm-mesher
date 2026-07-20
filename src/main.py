@@ -1,7 +1,5 @@
 import argparse
 import sys
-import csv
-import json
 import time
 import tracemalloc
 from pathlib import Path
@@ -52,7 +50,6 @@ def run_batch_mode() -> None:
         target_edge_length=target_h,
         smoothing_iterations=8,
     )
-    report_rows: list[dict[str, object]] = []
     tracemalloc.start()
 
     for image_name in test_images:
@@ -117,27 +114,7 @@ def run_batch_mode() -> None:
         if avg_quality < 0.7:
             print(f"[warn] {image_name}: average quality below target (0.7)")
 
-        report_rows.append(
-            {
-                "image": image_name,
-                "boundary_points": len(preprocessed.boundary),
-                "triangles": len(mesh.triangles),
-                "area": polygon_area,
-                "triangles_per_area": triangles_per_area,
-                "quality_min": quality.min_quality,
-                "quality_mean": quality.mean_quality,
-                "quality_max": quality.max_quality,
-                "quality_hist_bins": quality.histogram_bins,
-                "quality_hist_counts": quality.histogram_counts,
-                "time_preprocess_ms": (t1 - t0) * 1000.0,
-                "time_meshing_ms": (t2 - t1) * 1000.0,
-                "time_export_ms": (t3 - t2) * 1000.0,
-                "time_total_ms": (t3 - t0) * 1000.0,
-                "peak_mem_mb": peak_mem_mb,
-            }
-        )
     tracemalloc.stop()
-    _write_reports(output_dir, report_rows)
 
 
 def run_ui_mode() -> None:
@@ -194,41 +171,6 @@ def _polygon_area(polygon: list) -> float:
         p2 = polygon[(i + 1) % n]
         area += p1.x * p2.y - p2.x * p1.y
     return abs(area) / 2.0
-
-
-def _write_reports(output_dir: Path, rows: list[dict[str, object]]) -> None:
-    if not rows:
-        return
-    json_path = output_dir / "mesh_quality_report.json"
-    csv_path = output_dir / "mesh_benchmark_report.csv"
-
-    json_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
-
-    fieldnames = [
-        "image",
-        "boundary_points",
-        "triangles",
-        "area",
-        "triangles_per_area",
-        "quality_min",
-        "quality_mean",
-        "quality_max",
-        "quality_hist_bins",
-        "quality_hist_counts",
-        "time_preprocess_ms",
-        "time_meshing_ms",
-        "time_export_ms",
-        "time_total_ms",
-        "peak_mem_mb",
-    ]
-    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            out_row = dict(row)
-            out_row["quality_hist_bins"] = json.dumps(out_row["quality_hist_bins"])
-            out_row["quality_hist_counts"] = json.dumps(out_row["quality_hist_counts"])
-            writer.writerow(out_row)
 
 
 if __name__ == "__main__":

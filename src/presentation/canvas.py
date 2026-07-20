@@ -92,6 +92,20 @@ class Canvas(QWidget):
     def image_data(self) -> QImage:
         return self._image.copy()
 
+    def rendered_image(self) -> QImage:
+        image = self._image.copy()
+        painter = QPainter(image)
+        if self._geometry_overlay_enabled:
+            self._draw_geometry_contours(painter)
+        if self._invalid_segments:
+            self._draw_invalid_segments(painter)
+        if self._invalid_points:
+            self._draw_invalid_points(painter)
+        if self._mesh_overlay is not None:
+            self._draw_mesh_overlay(painter, self._mesh_overlay)
+        painter.end()
+        return image
+
     def canvas_size(self) -> QSize:
         return self._image.size()
 
@@ -205,6 +219,9 @@ class Canvas(QWidget):
     def set_mesh_overlay(self, mesh: Mesh | None) -> None:
         self._mesh_overlay = mesh
         self.update()
+
+    def mesh_overlay(self) -> Mesh | None:
+        return self._mesh_overlay
 
     def undo(self) -> bool:
         if not self._undo_stack:

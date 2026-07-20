@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -27,7 +28,15 @@ from PySide6.QtWidgets import (
 
 from src.application.services.boundary_validator import BoundaryValidator
 from src.application.services.mesh_postprocessing import compute_max_difference
-from src.domain.entities.mesh import Mesh
+from src.domain.entities.indexed_mesh import IndexedMesh
+from src.domain.entities.mesh import Mesh, MeshSourceContours
+from src.infrastructure.export.mesh_result_exporter import (
+    export_coordinates,
+    export_nodes,
+    export_statistics,
+    export_triangles,
+)
+from src.infrastructure.io.coordinate_json_importer import ImportedCoordinates
 from src.presentation.canvas import Canvas
 from src.presentation.tri_debug import tri_debug
 from src.presentation.tools import Tool, TriangulationMode
@@ -163,6 +172,7 @@ class TriangulationWorker(QObject):
         contours: list[list[tuple[int, int]]],
         mode: TriangulationMode,
         custom_settings: TriangulationSettings | None,
+        source_contours: MeshSourceContours | None = None,
     ) -> None:
         super().__init__()
         self._adapter = adapter
@@ -170,6 +180,7 @@ class TriangulationWorker(QObject):
         self._contours = contours
         self._mode = mode
         self._custom_settings = custom_settings
+        self._source_contours = source_contours
 
     def run(self) -> None:
         try:
@@ -178,12 +189,14 @@ class TriangulationWorker(QObject):
                     self._contours,
                     mode=self._mode,
                     custom_settings=self._custom_settings,
+                    source_contours=self._source_contours,
                 )
             else:
                 mesh, coefficient = self._adapter.run(
                     self._image_data,
                     mode=self._mode,
                     custom_settings=self._custom_settings,
+                    source_contours=self._source_contours,
                 )
         except Exception as error:  # noqa: BLE001
             self.failed.emit(str(error))
@@ -217,6 +230,7 @@ class PaintApp(QMainWindow):
         self._triangulation_busy = False
         self._triangulation_mode = TriangulationMode.BALANCED
         self._last_inclusion_types: dict[int, str] = {}
+        self._source_contours_for_triangulation: MeshSourceContours | None = None
         self._current_tool = Tool.PEN
         self._tool_status_label = QLabel("Tool: Pen")
         self._state_status_label = QLabel("Idle")
@@ -246,6 +260,7 @@ class PaintApp(QMainWindow):
         self._manual_group: QGroupBox
 
         self._build_central_workspace()
+        self._canvas.image_changed.connect(self._clear_source_contours_for_triangulation)
         self._build_toolbar()
         self._build_settings_panel()
         self._configure_status_bar()
@@ -260,8 +275,18 @@ class PaintApp(QMainWindow):
         mode, custom_settings = self._resolve_mode_and_settings()
         contours = self._contours_for_triangulation(image_data, prefer_strokes=True)
         if contours:
-            return self._triangulation_adapter.run_from_contours(contours, mode=mode, custom_settings=custom_settings)
-        return self._triangulation_adapter.run(image_data, mode=mode, custom_settings=custom_settings)
+            return self._triangulation_adapter.run_from_contours(
+                contours,
+                mode=mode,
+                custom_settings=custom_settings,
+                source_contours=self._source_contours_for_triangulation,
+            )
+        return self._triangulation_adapter.run(
+            image_data,
+            mode=mode,
+            custom_settings=custom_settings,
+            source_contours=self._source_contours_for_triangulation,
+        )
 
     def display_triangulation_result(self, mesh: Mesh, coefficient: float) -> None:
         self._canvas.set_mesh_overlay(mesh)
@@ -406,7 +431,7 @@ class PaintApp(QMainWindow):
         command_handlers: dict[str, tuple[str, Callable[[], None]]] = {
             "Undo": ("Undo last action", self._on_undo),
             "Redo": ("Redo last action", self._on_redo),
-            "Save": ("Зберегти зображення у PNG/JPG", self._on_save),
+            "Save": ("Зберегти результати", self._on_save),
             "Load": ("Завантажити зображення або координати з файлу", self._on_load),
             "Info": ("Show triangulation info", self.show_triangulation_info_dialog),
             "Triangulation": ("Run triangulation", self._on_triangulation),
@@ -1202,20 +1227,71 @@ class PaintApp(QMainWindow):
         self._build_triangulation_info_dialog().exec()
 
     def _on_save(self) -> None:
+        mesh = self._current_mesh_for_export()
+        if mesh is None:
+            return
+        indexed_mesh = self._current_indexed_mesh_for_export(mesh)
+        if indexed_mesh is None:
+            return
         path, selected_filter = QFileDialog.getSaveFileName(
             self,
-            "Зберегти полотно",
-            str(Path.cwd() / "mask.png"),
-            "PNG Image (*.png);;JPEG Image (*.jpg *.jpeg)",
+            "Зберегти результати",
+            str(Path.cwd() / self._default_results_base_name()),
+            "PNG Image (*.png)",
         )
         if not path:
             return
+        base_path = Path(path).with_suffix("")
+        image_path = base_path.with_suffix(".png")
+        triangulation_image_path = base_path.with_name(f"{base_path.name}_triangulation").with_suffix(".png")
+        triangles_path = base_path.with_name(f"{base_path.name}_triangles").with_suffix(".json")
+        nodes_path = base_path.with_name(f"{base_path.name}_nodes").with_suffix(".json")
+        coordinates_path = base_path.with_name(f"{base_path.name}_coordinates").with_suffix(".json")
+        stats_path = base_path.with_name(f"{base_path.name}_stats").with_suffix(".json")
+
         image = self._canvas.image_data()
+        triangulation_image = self._canvas.rendered_image()
         image_format = "PNG" if "PNG" in selected_filter else "JPEG"
-        if not image.save(path, image_format):
+        if not image.save(str(image_path), image_format):
             QMessageBox.critical(self, "Помилка збереження", "Не вдалося зберегти зображення.")
             return
-        self.statusBar().showMessage(f"Зображення збережено: {path}")
+        if not triangulation_image.save(str(triangulation_image_path), image_format):
+            QMessageBox.critical(self, "Помилка збереження", "Не вдалося зберегти зображення з тріангуляцією.")
+            return
+        export_triangles(mesh, triangles_path)
+        export_nodes(indexed_mesh, nodes_path)
+        export_statistics(mesh, stats_path)
+        try:
+            export_coordinates(mesh, coordinates_path)
+        except ValueError:
+            pass
+        self.statusBar().showMessage(f"Результати збережено: {base_path.parent}")
+
+    @staticmethod
+    def _default_results_base_name() -> str:
+        return f"mesh_{datetime.now().strftime('%Y-%m-%d_%H%M')}"
+
+    def _current_mesh_for_export(self) -> Mesh | None:
+        mesh = self._canvas.mesh_overlay()
+        if mesh is None:
+            QMessageBox.warning(
+                self,
+                "Немає сітки",
+                "Спочатку виконайте тріангуляцію, щоб зберегти результати сітки.",
+            )
+            return None
+        return mesh
+
+    def _current_indexed_mesh_for_export(self, mesh: Mesh) -> IndexedMesh | None:
+        indexed_mesh = mesh.indexed_mesh_data
+        if indexed_mesh is None:
+            QMessageBox.warning(
+                self,
+                "Немає індексованої сітки",
+                "Поточна сітка не містить індексованих даних вузлів. Повторіть тріангуляцію.",
+            )
+            return None
+        return indexed_mesh
 
     def _on_load(self) -> None:
         path, selected_filter = QFileDialog.getOpenFileName(
@@ -1249,6 +1325,7 @@ class PaintApp(QMainWindow):
                 redraw_image=False,
                 emit_change=True,
             )
+            self._source_contours_for_triangulation = self._mesh_source_contours_from_imported(imported)
             self._canvas.update()
             self._last_inclusion_types = {
                 1 + i: inc_type
@@ -1268,6 +1345,7 @@ class PaintApp(QMainWindow):
         if image.isNull():
             QMessageBox.critical(self, "Помилка завантаження", "Не вдалося завантажити зображення.")
             return
+        self._source_contours_for_triangulation = None
         binary = Canvas.binarize_image(image, threshold=127)
         self._canvas.set_image(binary)
         self._refresh_geometry_from_canvas_image(binary, prefer_strokes=True)
@@ -1393,6 +1471,7 @@ class PaintApp(QMainWindow):
             contours,
             mode,
             custom_settings,
+            self._source_contours_for_triangulation,
         )
         self._triangulation_worker.moveToThread(self._triangulation_thread)
 
@@ -1403,6 +1482,25 @@ class PaintApp(QMainWindow):
         self._triangulation_worker.failed.connect(self._cleanup_triangulation_thread)
 
         self._triangulation_thread.start()
+
+    def _clear_source_contours_for_triangulation(self) -> None:
+        self._source_contours_for_triangulation = None
+
+    def _mesh_source_contours_from_imported(self, imported: ImportedCoordinates) -> MeshSourceContours:
+        return MeshSourceContours(
+            outer_boundary=[(float(x), float(y)) for x, y in imported.outer_boundary],
+            inclusions=[
+                (
+                    [(float(x), float(y)) for x, y in vertices],
+                    inc_type,
+                )
+                for vertices, inc_type in imported.inclusions
+            ],
+            cuts=[
+                [(float(x), float(y)) for x, y in cut]
+                for cut in imported.cuts
+            ],
+        )
 
     def _refresh_geometry_from_canvas_image(
         self,

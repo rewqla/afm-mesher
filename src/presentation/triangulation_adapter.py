@@ -14,7 +14,7 @@ from src.application.services.polygon_builder import PolygonBuilder
 from src.application.services.region_classifier import RegionClassifier
 from src.application.services.region_topology import ClassifiedRegion, RegionPolygon
 from src.domain.entities.point import Point
-from src.domain.entities.mesh import Mesh
+from src.domain.entities.mesh import Mesh, MeshSourceContours
 from src.domain.geometry.geometry_utils import mesh_average_quality, point_in_polygon, segments_intersect
 from src.infrastructure.image.photo_preprocessor import simplify_contour
 from src.infrastructure.processing.image_boundary_extractor import extract_contours
@@ -79,24 +79,28 @@ class TriangulationAdapter:
         image_data: QImage,
         mode: TriangulationMode = TriangulationMode.FAST,
         custom_settings: TriangulationSettings | None = None,
+        source_contours: MeshSourceContours | None = None,
     ) -> tuple[Mesh, float]:
         settings = self._resolve_settings(mode, custom_settings)
         raw_contours = self._extract_geometry_contours(image_data)
-        return self._run_with_contours(raw_contours, settings)
+        return self._run_with_contours(raw_contours, settings, source_contours=source_contours)
 
     def run_from_contours(
         self,
         contours: list[list[tuple[int, int]]],
         mode: TriangulationMode = TriangulationMode.FAST,
         custom_settings: TriangulationSettings | None = None,
+        source_contours: MeshSourceContours | None = None,
     ) -> tuple[Mesh, float]:
         settings = self._resolve_settings(mode, custom_settings)
-        return self._run_with_contours(contours, settings)
+        return self._run_with_contours(contours, settings, source_contours=source_contours)
 
     def _run_with_contours(
         self,
         raw_contours: list[Contour],
         settings: TriangulationSettings,
+        *,
+        source_contours: MeshSourceContours | None = None,
     ) -> tuple[Mesh, float]:
         tri_debug(
             "tri_adapter.run_with_contours.start",
@@ -184,6 +188,7 @@ class TriangulationAdapter:
             meters_per_pixel=settings.meters_per_pixel,
             node_order=mesh.node_order,
             indexed_mesh_data=mesh.indexed_mesh_data,
+            source_contours=source_contours,
         )
         if not mesh.triangles:
             raise ValueError("Triangulation produced no valid triangles for the selected region.")
