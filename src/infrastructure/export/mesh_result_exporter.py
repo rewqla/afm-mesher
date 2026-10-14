@@ -40,6 +40,13 @@ def export_coordinates(mesh: Mesh, path: Path) -> None:
 
 
 def export_triangles(mesh: Mesh, path: Path) -> None:
+    linear_triangles = mesh.linear_triangles(key_precision=_KEY_PRECISION)
+    indexed_mesh = mesh.indexed_mesh(key_precision=_KEY_PRECISION)
+    # Linear triangles are renumbered (and may be reoriented): match them by their node set.
+    subdomain_by_nodes = {
+        frozenset(triangle): indexed_mesh.triangle_subdomain(position)
+        for position, triangle in enumerate(indexed_mesh.triangles)
+    }
     payload = {
         "triangles": [
             {
@@ -48,21 +55,30 @@ def export_triangles(mesh: Mesh, path: Path) -> None:
                 "node_numbers": list(triangle.node_numbers),
                 "node_coordinates": [[point.x, point.y] for point in triangle.node_coordinates],
                 "area": triangle.area,
+                # 0 = main domain, k = k-th merge inclusion.
+                "subdomain": subdomain_by_nodes.get(frozenset(triangle.node_numbers), 0),
             }
-            for triangle in mesh.linear_triangles(key_precision=_KEY_PRECISION)
+            for triangle in linear_triangles
         ],
+        # Cut as meshed: every segment is a triangle edge (the drawn stroke is simplified).
+        "cut_edges": [[[start.x, start.y], [end.x, end.y]] for start, end in mesh.cut_edges],
+        "interface_edges": [[[start.x, start.y], [end.x, end.y]] for start, end in mesh.interface_edges],
         "meters_per_pixel": mesh.meters_per_pixel,
     }
     _write_json(path, payload)
 
 
 def export_nodes(indexed_mesh: IndexedMesh, path: Path) -> None:
+    twins = indexed_mesh.twin_map()
     payload = {
         "nodes": [
             {
                 "node_number": node_id,
                 "coordinates": [x, y],
                 "attribute": _node_type_label(indexed_mesh.node_type(node_id)),
+                "on_boundary": node_id in indexed_mesh.boundary_nodes,
+                # Other numbers of the same point on a cut / merge-inclusion boundary (one per side).
+                "twins": list(twins.get(node_id, ())),
             }
             for node_id, (x, y) in _iter_indexed_nodes(indexed_mesh)
         ],
@@ -128,8 +144,6 @@ def _iter_indexed_nodes(indexed_mesh: IndexedMesh) -> list[tuple[int, tuple[floa
 
 
 def _node_type_label(node_type: NodeType) -> str:
-    if node_type == NodeType.INTERFACE:
-        return "cut"
     return node_type.value
 
 

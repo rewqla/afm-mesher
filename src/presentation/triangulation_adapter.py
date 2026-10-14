@@ -3,18 +3,23 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from dataclasses import replace
 from math import ceil, hypot, isclose
+from time import monotonic, perf_counter
 from typing import ClassVar
 
 from PySide6.QtGui import QColor, QImage
 
-from src.application.services.advancing_front_mesher import AdvancingFrontMesher
+from src.application.services.advancing_front_mesher import (
+    DEFAULT_TIME_BUDGET_S,
+    AdvancingFrontMesher,
+    MeshingTimeoutError,
+)
 from src.application.services.boundary_detection_service import BoundaryDetectionService
 from src.application.services.obstacle_processor import ObstacleProcessor
 from src.application.services.polygon_builder import PolygonBuilder
 from src.application.services.region_classifier import RegionClassifier
 from src.application.services.region_topology import ClassifiedRegion, RegionPolygon
 from src.domain.entities.point import Point
-from src.domain.entities.mesh import Mesh, MeshSourceContours
+from src.domain.entities.mesh import Mesh, MeshSourceContours, TriangulationTimings
 from src.domain.geometry.geometry_utils import mesh_average_quality, point_in_polygon, segments_intersect
 from src.infrastructure.image.photo_preprocessor import simplify_contour
 from src.infrastructure.processing.image_boundary_extractor import extract_contours
@@ -28,6 +33,10 @@ from src.presentation.tools import TriangulationMode
 
 Mask = list[list[int]]
 Contour = list[tuple[int, int]]
+
+INCLUSION_IGNORE = "ignore"
+INCLUSION_MERGE = "merge"
+INCLUSION_TYPES = (INCLUSION_IGNORE, INCLUSION_MERGE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +66,8 @@ class TriangulationAdapter:
 
     threshold: int = 127
     numbering_strategy: str = "rcm_multistart"
+    # Wall-clock budget for one triangulation request (all AFM passes and cut variants together).
+    time_budget_s: float = DEFAULT_TIME_BUDGET_S
     _mesher: AdvancingFrontMesher = field(init=False, repr=False)
     _boundary_detection: BoundaryDetectionService = field(init=False, repr=False)
     _region_classifier: RegionClassifier = field(init=False, repr=False)
@@ -80,10 +91,18 @@ class TriangulationAdapter:
         mode: TriangulationMode = TriangulationMode.FAST,
         custom_settings: TriangulationSettings | None = None,
         source_contours: MeshSourceContours | None = None,
+        inclusion_mode: str = INCLUSION_IGNORE,
     ) -> tuple[Mesh, float]:
+        started_at = perf_counter()
         settings = self._resolve_settings(mode, custom_settings)
         raw_contours = self._extract_geometry_contours(image_data)
-        return self._run_with_contours(raw_contours, settings, source_contours=source_contours)
+        return self._run_with_contours(
+            raw_contours,
+            settings,
+            source_contours=source_contours,
+            inclusion_mode=inclusion_mode,
+            started_at=started_at,
+        )
 
     def run_from_contours(
         self,
@@ -91,9 +110,19 @@ class TriangulationAdapter:
         mode: TriangulationMode = TriangulationMode.FAST,
         custom_settings: TriangulationSettings | None = None,
         source_contours: MeshSourceContours | None = None,
+        inclusion_mode: str = INCLUSION_IGNORE,
     ) -> tuple[Mesh, float]:
+        """`inclusion_mode` applies to every inclusion of drawn geometry; with `source_contours`
+        (coordinate import) each inclusion uses its own type instead."""
+        started_at = perf_counter()
         settings = self._resolve_settings(mode, custom_settings)
-        return self._run_with_contours(contours, settings, source_contours=source_contours)
+        return self._run_with_contours(
+            contours,
+            settings,
+            source_contours=source_contours,
+            inclusion_mode=inclusion_mode,
+            started_at=started_at,
+        )
 
     def _run_with_contours(
         self,
@@ -101,20 +130,28 @@ class TriangulationAdapter:
         settings: TriangulationSettings,
         *,
         source_contours: MeshSourceContours | None = None,
+        inclusion_mode: str = INCLUSION_IGNORE,
+        started_at: float | None = None,
     ) -> tuple[Mesh, float]:
+        if started_at is None:
+            started_at = perf_counter()
+        if inclusion_mode not in INCLUSION_TYPES:
+            raise ValueError(f"Unknown inclusion mode: {inclusion_mode!r}.")
         tri_debug(
             "tri_adapter.run_with_contours.start",
             raw_contours=len(raw_contours),
             target_h=settings.target_edge_length,
             epsilon=settings.contour_epsilon,
         )
-        closed_contours, open_contours = self._split_closed_and_open_contours(raw_contours, settings.contour_epsilon)
+        # Imported coordinates are the user's exact vertices: only hand-drawn strokes are simplified.
+        epsilon = 0.0 if source_contours is not None else settings.contour_epsilon
+        closed_contours, open_contours = self._split_closed_and_open_contours(raw_contours, epsilon)
         tri_debug(
             "tri_adapter.run_with_contours.split",
             closed=len(closed_contours),
             open=len(open_contours),
         )
-        polygons = self._build_polygons(closed_contours, settings.contour_epsilon)
+        polygons = self._build_polygons(closed_contours, epsilon)
         regions = self._region_classifier.classify(polygons)
         tri_debug("tri_adapter.run_with_contours.regions", polygons=len(polygons), regions=len(regions))
         if not regions:
@@ -136,7 +173,10 @@ class TriangulationAdapter:
             )
             for hole in holes
         ]
-        cuts = self._extract_cuts(open_contours, settings.contour_epsilon)
+        merge_flags = self._merge_flags(holes, raw_contours, source_contours, inclusion_mode)
+        merge_rings = [hole.points for hole, merge in zip(holes, merge_flags) if merge]
+        holes = [hole for hole, merge in zip(holes, merge_flags) if not merge]
+        cuts = self._extract_cuts(open_contours, epsilon)
         cuts = [self._optimize_polyline_for_meshing(cut, settings.target_edge_length, max_points=500) for cut in cuts]
         cuts = [cut for cut in cuts if len(cut) >= 2]
         cuts = self._filter_cuts_conflicting_with_holes(cuts, holes)
@@ -148,12 +188,15 @@ class TriangulationAdapter:
             target_edge_length=runtime_settings.target_edge_length,
             smoothing_iterations=runtime_settings.smoothing_iterations,
             numbering_strategy=self.numbering_strategy,
+            time_budget_s=self.time_budget_s,
         )
+        deadline = monotonic() + self.time_budget_s
         hole_points = [hole.points for hole in holes]
         tri_debug(
             "tri_adapter.run_with_contours.geometry",
             boundary_points=len(boundary),
             holes=len(hole_points),
+            merge_inclusions=len(merge_rings),
             cuts=len(cuts),
         )
         attempted_cuts = [cuts, self._prune_overlapping_collinear_cuts(cuts)]
@@ -162,15 +205,21 @@ class TriangulationAdapter:
             attempted_cuts.append([])
         mesh: Mesh | None = None
         last_error: ValueError | None = None
+        contours_s = perf_counter() - started_at
+        stage_s = {"afm": 0.0, "postprocess": 0.0, "numbering": 0.0}
         for candidate_cuts in attempted_cuts:
             try:
-                mesh = self._mesher.generate_with_holes_and_cuts(boundary, hole_points, candidate_cuts)
+                mesh = self._mesher.generate_with_holes_and_cuts(
+                    boundary, hole_points, candidate_cuts, deadline=deadline, merge_inclusions=merge_rings
+                )
                 tri_debug(
                     "tri_adapter.run_with_contours.mesh_success",
                     candidate_cuts=len(candidate_cuts),
                     triangles=len(mesh.triangles),
                 )
                 break
+            except MeshingTimeoutError:
+                raise
             except ValueError as error:
                 last_error = error
                 tri_debug(
@@ -179,6 +228,9 @@ class TriangulationAdapter:
                     error=str(error),
                 )
                 continue
+            finally:
+                for stage, seconds in self._mesher.last_stage_timings.items():
+                    stage_s[stage] += seconds
         if mesh is None:
             if last_error is not None:
                 raise last_error
@@ -189,11 +241,51 @@ class TriangulationAdapter:
             node_order=mesh.node_order,
             indexed_mesh_data=mesh.indexed_mesh_data,
             source_contours=source_contours,
+            cut_edges=mesh.cut_edges,
+            interface_edges=mesh.interface_edges,
         )
         if not mesh.triangles:
             raise ValueError("Triangulation produced no valid triangles for the selected region.")
         coefficient = mesh_average_quality(mesh)
+        mesh.timings = TriangulationTimings(
+            total_s=perf_counter() - started_at,
+            contours_s=contours_s,
+            afm_s=stage_s["afm"],
+            postprocess_s=stage_s["postprocess"],
+            numbering_s=stage_s["numbering"],
+        )
         return mesh, coefficient
+
+    def _merge_flags(
+        self,
+        holes: list[RegionPolygon],
+        raw_contours: list[Contour],
+        source_contours: MeshSourceContours | None,
+        inclusion_mode: str,
+    ) -> list[bool]:
+        """Which inner contours are merge inclusions. Imported geometry keeps its per-inclusion type:
+        raw contours follow the import order (outer boundary, inclusions, cuts), so a hole is matched
+        to the inclusion contour that contains it and is contained by it."""
+        if source_contours is None:
+            return [inclusion_mode == INCLUSION_MERGE for _ in holes]
+        inclusion_polygons = [
+            [Point(float(x), float(y)) for x, y in contour]
+            for contour in raw_contours[1:1 + len(source_contours.inclusions)]
+        ]
+        flags: list[bool] = []
+        for hole in holes:
+            probe = self._representative_point(hole.points)
+            flag = False
+            for polygon, (_, inclusion_type) in zip(inclusion_polygons, source_contours.inclusions):
+                if len(polygon) < 3:
+                    continue
+                if point_in_polygon(probe, polygon, include_boundary=False) and point_in_polygon(
+                    self._representative_point(polygon), hole.points, include_boundary=False
+                ):
+                    flag = inclusion_type == INCLUSION_MERGE
+                    break
+            flags.append(flag)
+        return flags
 
     def _filter_cuts_conflicting_with_holes(
         self,

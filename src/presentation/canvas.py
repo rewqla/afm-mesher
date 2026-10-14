@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
+from PySide6.QtCore import QLineF, QPoint, QPointF, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import QWidget
 
@@ -9,6 +9,9 @@ from src.domain.geometry.contour_pipeline import preprocess_contour, smart_appen
 from src.domain.entities.mesh import Mesh
 from src.presentation.tools import Tool
 from src.presentation.tri_debug import tri_debug
+
+
+_IMAGE_OPACITY_UNDER_MESH = 0.25
 
 
 class Canvas(QWidget):
@@ -95,6 +98,9 @@ class Canvas(QWidget):
     def rendered_image(self) -> QImage:
         image = self._image.copy()
         painter = QPainter(image)
+        if self._dims_image_under_mesh():
+            image.fill(Qt.GlobalColor.white)
+            self._draw_base_image(painter)
         if self._geometry_overlay_enabled:
             self._draw_geometry_contours(painter)
         if self._invalid_segments:
@@ -389,7 +395,7 @@ class Canvas(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: ANN001
         painter = QPainter(self)
-        painter.drawImage(0, 0, self._image)
+        self._draw_base_image(painter)
 
         if self._drawing and self._tool in (Tool.SEGMENT, Tool.RECTANGLE, Tool.CIRCLE):
             self._draw_shape_preview(painter)
@@ -514,17 +520,38 @@ class Canvas(QWidget):
                 if run_start is not None:
                     stack.append(((run_start + right) // 2, neighbor_y))
 
+    def _dims_image_under_mesh(self) -> bool:
+        mesh = self._mesh_overlay
+        return mesh is not None and bool(mesh.cut_edges or mesh.interface_edges)
+
+    def _draw_base_image(self, painter: QPainter) -> None:
+        # The raw pen stroke stays in the bitmap, but the mesher meshes its simplified polyline.
+        # Fade the bitmap under a mesh with cuts so the visible cut is the mesh's own edge chain.
+        if self._dims_image_under_mesh():
+            painter.setOpacity(_IMAGE_OPACITY_UNDER_MESH)
+        painter.drawImage(0, 0, self._image)
+        painter.setOpacity(1.0)
+
     def _draw_mesh_overlay(self, painter: QPainter, mesh: Mesh) -> None:
         pen = QPen(Qt.GlobalColor.red, 1, Qt.PenStyle.SolidLine)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         for triangle in mesh.triangles:
-            a = QPoint(int(triangle.a.x), int(triangle.a.y))
-            b = QPoint(int(triangle.b.x), int(triangle.b.y))
-            c = QPoint(int(triangle.c.x), int(triangle.c.y))
-            painter.drawLine(a, b)
-            painter.drawLine(b, c)
-            painter.drawLine(c, a)
+            a = QPointF(triangle.a.x, triangle.a.y)
+            b = QPointF(triangle.b.x, triangle.b.y)
+            c = QPointF(triangle.c.x, triangle.c.y)
+            painter.drawLine(QLineF(a, b))
+            painter.drawLine(QLineF(b, c))
+            painter.drawLine(QLineF(c, a))
+        if mesh.cut_edges:
+            painter.setPen(QPen(QColor("#111827"), 2.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            for start, end in mesh.cut_edges:
+                painter.drawLine(QLineF(start.x, start.y, end.x, end.y))
+        if mesh.interface_edges:
+            # Merge-inclusion boundary: the chain of mesh edges shared by both subdomains.
+            painter.setPen(QPen(QColor("#15803d"), 2.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            for start, end in mesh.interface_edges:
+                painter.drawLine(QLineF(start.x, start.y, end.x, end.y))
 
     def _draw_invalid_segments(self, painter: QPainter) -> None:
         pen = QPen(Qt.GlobalColor.yellow, 3, Qt.PenStyle.DashLine)
@@ -546,9 +573,15 @@ class Canvas(QWidget):
             if len(contour) < 2:
                 continue
             is_closed = self._contour_is_closed(contour)
+            if not is_closed and self._mesh_overlay is not None:
+                # Under a mesh the cut is drawn from mesh.cut_edges, not from the raw stroke.
+                continue
             if is_closed and not first_closed_drawn:
                 pen = QPen(QColor("#2563eb"), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
                 first_closed_drawn = True
+            elif is_closed and self._mesh_overlay is not None and self._mesh_overlay.interface_edges:
+                # Merge-inclusion boundaries are drawn from mesh.interface_edges.
+                continue
             elif is_closed:
                 pen = QPen(QColor("#16a34a"), 2, Qt.PenStyle.DashLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
             else:

@@ -724,6 +724,7 @@ class TestAdvancingFrontMesher(unittest.TestCase):
                 ],
             ) as generate_single_pass,
             patch.object(mesher, "_validate_cut_segments_are_mesh_edges", return_value=None),
+            patch.object(mesher, "_validate_final_mesh", return_value=None),
         ):
             mesh = mesher.generate_with_holes_and_cuts(boundary, holes=[], cuts=[])
 

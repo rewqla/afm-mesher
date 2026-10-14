@@ -81,7 +81,7 @@ class TestMeshResultExporter(unittest.TestCase):
         self.assertEqual(len(first["node_coordinates"]), 3)
         self.assertIn("area", first)
 
-    def test_export_nodes_serializes_interface_as_cut(self) -> None:
+    def test_export_nodes_serializes_interface_and_on_boundary(self) -> None:
         indexed = self._sample_indexed_mesh()
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -91,8 +91,12 @@ class TestMeshResultExporter(unittest.TestCase):
 
         attributes = {node["node_number"]: node["attribute"] for node in payload["nodes"]}
         self.assertEqual(attributes[1], "boundary")
-        self.assertEqual(attributes[2], "cut")
+        self.assertEqual(attributes[2], "interface")
         self.assertEqual(attributes[5], "interior")
+        on_boundary = {node["node_number"]: node["on_boundary"] for node in payload["nodes"]}
+        self.assertEqual(on_boundary, {n: n in indexed.boundary_nodes for n in on_boundary})
+        self.assertTrue(on_boundary[1])
+        self.assertFalse(on_boundary[5])
 
     def test_export_statistics_writes_mesh_summary(self) -> None:
         mesh = self._sample_mesh()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime
+from time import perf_counter
 from pathlib import Path
 from typing import Callable
 
@@ -29,7 +30,7 @@ from PySide6.QtWidgets import (
 from src.application.services.boundary_validator import BoundaryValidator
 from src.application.services.mesh_postprocessing import compute_max_difference
 from src.domain.entities.indexed_mesh import IndexedMesh
-from src.domain.entities.mesh import Mesh, MeshSourceContours
+from src.domain.entities.mesh import Mesh, MeshSourceContours, TriangulationTimings
 from src.infrastructure.export.mesh_result_exporter import (
     export_coordinates,
     export_nodes,
@@ -40,7 +41,12 @@ from src.infrastructure.io.coordinate_json_importer import ImportedCoordinates
 from src.presentation.canvas import Canvas
 from src.presentation.tri_debug import tri_debug
 from src.presentation.tools import Tool, TriangulationMode
-from src.presentation.triangulation_adapter import TriangulationAdapter, TriangulationSettings
+from src.presentation.triangulation_adapter import (
+    INCLUSION_IGNORE,
+    INCLUSION_MERGE,
+    TriangulationAdapter,
+    TriangulationSettings,
+)
 
 TRIANGULATION_INFO_DIALOG_TEXT = (
     "Зверніть увагу на особливості роботи з включеннями та розрізами перед початком тріангуляції:\n\n"
@@ -111,6 +117,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "tool_circle": "Коло",
         "tri_info_title": "Інформація про тріангуляцію",
         "continue": "Продовжити",
+        "inclusions": "Включення:",
+        "inclusion_ignore": "Не враховувати",
+        "inclusion_merge": "Тріангулювати зі склейкою",
+        "time_done": "Час: {total}",
+        "time_failed": "Час до помилки: {total}",
+        "time_stages": "контури {contours} · AFM {afm} · постобробка {postprocess} · нумерація {numbering}",
+        "unit_s": "с",
+        "unit_ms": "мс",
     },
     "en": {
         "window_title": "AFM Mask Editor",
@@ -157,6 +171,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "tool_circle": "Circle",
         "tri_info_title": "Triangulation Info",
         "continue": "Continue",
+        "inclusions": "Inclusions:",
+        "inclusion_ignore": "Ignore",
+        "inclusion_merge": "Triangulate and glue",
+        "time_done": "Time: {total}",
+        "time_failed": "Time until error: {total}",
+        "time_stages": "contours {contours} · AFM {afm} · postprocessing {postprocess} · numbering {numbering}",
+        "unit_s": "s",
+        "unit_ms": "ms",
     },
 }
 
@@ -173,8 +195,10 @@ class TriangulationWorker(QObject):
         mode: TriangulationMode,
         custom_settings: TriangulationSettings | None,
         source_contours: MeshSourceContours | None = None,
+        inclusion_mode: str = INCLUSION_IGNORE,
     ) -> None:
         super().__init__()
+        self._inclusion_mode = inclusion_mode
         self._adapter = adapter
         self._image_data = image_data
         self._contours = contours
@@ -190,6 +214,7 @@ class TriangulationWorker(QObject):
                     mode=self._mode,
                     custom_settings=self._custom_settings,
                     source_contours=self._source_contours,
+                    inclusion_mode=self._inclusion_mode,
                 )
             else:
                 mesh, coefficient = self._adapter.run(
@@ -197,6 +222,7 @@ class TriangulationWorker(QObject):
                     mode=self._mode,
                     custom_settings=self._custom_settings,
                     source_contours=self._source_contours,
+                    inclusion_mode=self._inclusion_mode,
                 )
         except Exception as error:  # noqa: BLE001
             self.failed.emit(str(error))
@@ -235,10 +261,14 @@ class PaintApp(QMainWindow):
         self._tool_status_label = QLabel("Tool: Pen")
         self._state_status_label = QLabel("Idle")
         self._mode_status_label = QLabel("Triangulation: Balanced")
+        self._triangulation_started_at: float | None = None
+        # (succeeded, total seconds, stage timings) of the current/last run; None once a new run starts.
+        self._last_triangulation_time: tuple[bool, float, TriangulationTimings | None] | None = None
         self._status_progress = QProgressBar()
         self._canvas_resize_in_progress = False
 
         self._mode_combo: QComboBox
+        self._inclusion_combo: QComboBox
         self._theme_combo: QComboBox
         self._language_combo: QComboBox
         self._size_preset_combo: QComboBox
@@ -280,25 +310,31 @@ class PaintApp(QMainWindow):
                 mode=mode,
                 custom_settings=custom_settings,
                 source_contours=self._source_contours_for_triangulation,
+                inclusion_mode=self.inclusion_mode(),
             )
         return self._triangulation_adapter.run(
             image_data,
             mode=mode,
             custom_settings=custom_settings,
             source_contours=self._source_contours_for_triangulation,
+            inclusion_mode=self.inclusion_mode(),
         )
+
+    def inclusion_mode(self) -> str:
+        """Inclusion type for drawn geometry; imported JSON keeps each inclusion's own type."""
+        return str(self._inclusion_combo.currentData())
 
     def display_triangulation_result(self, mesh: Mesh, coefficient: float) -> None:
         self._canvas.set_mesh_overlay(mesh)
         node_difference = self._mesh_node_difference(mesh)
         node_count = self._mesh_node_count(mesh)
-        self.statusBar().showMessage(
-            self._t("status_tri_done_with_diff").format(
-                coefficient=coefficient,
-                node_count=node_count,
-                node_difference=node_difference,
-            )
+        message = self._t("status_tri_done_with_diff").format(
+            coefficient=coefficient,
+            node_count=node_count,
+            node_difference=node_difference,
         )
+        time_text = self._triangulation_time_text()
+        self.statusBar().showMessage(f"{message}; {time_text}" if time_text else message)
         self._state_status_label.setText(self._t("status_idle"))
 
     def _t(self, key: str) -> str:
@@ -324,6 +360,11 @@ class PaintApp(QMainWindow):
         self._mode_combo.setItemText(1, self._t("mode_balanced"))
         self._mode_combo.setItemText(2, self._t("mode_accurate"))
         self._mode_combo.setItemText(3, self._t("mode_custom"))
+        self._inclusion_combo.setItemText(0, self._t("inclusion_ignore"))
+        self._inclusion_combo.setItemText(1, self._t("inclusion_merge"))
+        inclusion_label = self._settings_layout.labelForField(self._inclusion_combo)
+        if inclusion_label is not None:
+            inclusion_label.setText(self._t("inclusions"))
         self._size_preset_combo.setItemText(self._size_preset_combo.count() - 1, self._t("custom"))
         self._custom_checkbox.setText(self._t("use_custom_values"))
         theme_label = self._settings_layout.labelForField(self._theme_combo)
@@ -545,6 +586,11 @@ class PaintApp(QMainWindow):
         self._mode_combo.addItem("Custom", TriangulationMode.CUSTOM.value)
         self._mode_combo.currentIndexChanged.connect(self._on_mode_combo_changed)
         layout.addRow("Preset:", self._mode_combo)
+
+        self._inclusion_combo = QComboBox()
+        self._inclusion_combo.addItem("Ignore", INCLUSION_IGNORE)
+        self._inclusion_combo.addItem("Triangulate and glue", INCLUSION_MERGE)
+        layout.addRow("Inclusions:", self._inclusion_combo)
 
         self._custom_checkbox = QCheckBox("Use custom values")
         self._custom_checkbox.stateChanged.connect(self._on_custom_toggle_changed)
@@ -1428,6 +1474,8 @@ class PaintApp(QMainWindow):
     def _on_triangulation(self) -> None:
         if self._triangulation_busy:
             return
+        self._triangulation_started_at = perf_counter()
+        self._last_triangulation_time = None
         image_data = self._canvas.image_data()
         self._canvas.set_invalid_points([])
         contours = self._contours_for_triangulation(
@@ -1472,6 +1520,7 @@ class PaintApp(QMainWindow):
             mode,
             custom_settings,
             self._source_contours_for_triangulation,
+            self.inclusion_mode(),
         )
         self._triangulation_worker.moveToThread(self._triangulation_thread)
 
@@ -1664,13 +1713,42 @@ class PaintApp(QMainWindow):
 
     def _on_triangulation_finished(self, mesh: object, coefficient: float) -> None:
         self._set_triangulation_busy(False)
+        self._last_triangulation_time = (True, self._elapsed_since_triangulation_start(), getattr(mesh, "timings", None))
         self.display_triangulation_result(mesh, coefficient)
 
     def _on_triangulation_failed(self, message: str) -> None:
         self._set_triangulation_busy(False)
+        self._last_triangulation_time = (False, self._elapsed_since_triangulation_start(), None)
         QMessageBox.warning(self, "Triangulation Error", message)
-        self.statusBar().showMessage(self._t("status_tri_failed"))
+        self.statusBar().showMessage(f"{self._t('status_tri_failed')}; {self._triangulation_time_text()}")
         self._state_status_label.setText(self._t("status_idle"))
+
+    def _elapsed_since_triangulation_start(self) -> float:
+        if self._triangulation_started_at is None:
+            return 0.0
+        return perf_counter() - self._triangulation_started_at
+
+    def _triangulation_time_text(self) -> str:
+        if self._last_triangulation_time is None:
+            return ""
+        succeeded, total_s, timings = self._last_triangulation_time
+        # Stages use the unit of the total so the numbers are comparable at a glance.
+        in_ms = total_s < 1.0
+        unit = self._t("unit_ms") if in_ms else self._t("unit_s")
+
+        def number(seconds: float) -> str:
+            return f"{seconds * 1000.0:.0f}" if in_ms else f"{seconds:.2f}"
+
+        text = self._t("time_done" if succeeded else "time_failed").format(total=f"{number(total_s)} {unit}")
+        if succeeded and timings is not None:
+            stages = self._t("time_stages").format(
+                contours=number(timings.contours_s),
+                afm=number(timings.afm_s),
+                postprocess=number(timings.postprocess_s),
+                numbering=number(timings.numbering_s),
+            )
+            text = f"{text} ({stages})"
+        return text
 
     def _cleanup_triangulation_thread(self) -> None:
         if self._triangulation_thread is not None:

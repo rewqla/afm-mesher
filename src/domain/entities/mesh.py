@@ -21,6 +21,19 @@ class MeshSourceContours:
     cuts: list[list[tuple[float, float]]]
 
 
+@dataclass(frozen=True, slots=True)
+class TriangulationTimings:
+    """Wall-clock seconds (time.perf_counter) spent by one triangulation run, per stage.
+
+    Stages may not add up to `total_s`: the rest is glue code between them."""
+
+    total_s: float
+    contours_s: float = 0.0
+    afm_s: float = 0.0
+    postprocess_s: float = 0.0
+    numbering_s: float = 0.0
+
+
 @dataclass(slots=True)
 class Mesh:
     triangles: list[Triangle]
@@ -28,6 +41,12 @@ class Mesh:
     node_order: tuple[Point, ...] | None = None
     indexed_mesh_data: IndexedMesh | None = None
     source_contours: MeshSourceContours | None = None
+    # Cut segments exactly as the mesher constrained them (each is an edge of the mesh).
+    # Display/export must use these instead of the raw drawn stroke, which the adapter simplifies.
+    cut_edges: tuple[tuple[Point, Point], ...] = ()
+    # Boundary of merge inclusions as meshed (each segment is an edge shared by both subdomains).
+    interface_edges: tuple[tuple[Point, Point], ...] = ()
+    timings: TriangulationTimings | None = None
     _linear_triangles_cache: dict[tuple[int, float], tuple[LinearTriangle, ...]] = field(
         default_factory=dict,
         init=False,
@@ -85,8 +104,14 @@ class Mesh:
     ) -> IndexedMesh:
         if key_precision < 0:
             raise ValueError("key_precision must be >= 0")
-        if boundary_points is None and interface_points is None and self.indexed_mesh_data is not None:
-            return self.indexed_mesh_data
+        if self.indexed_mesh_data is not None:
+            if boundary_points is None and interface_points is None:
+                return self.indexed_mesh_data
+            # Keep the mesher's numbering (cut twins share coordinates and must not be glued back);
+            # only re-derive the node attributes from the given points.
+            return self._reclassified_indexed_mesh(
+                self.indexed_mesh_data, boundary_points, interface_points, key_precision
+            )
 
         key_to_node_number: dict[tuple[float, float], int] = {}
         node_coordinates_by_id: dict[int, tuple[float, float]] = {}
@@ -144,6 +169,37 @@ class Mesh:
         if boundary_points is None and interface_points is None:
             self.indexed_mesh_data = indexed_mesh
         return indexed_mesh
+
+    def _reclassified_indexed_mesh(
+        self,
+        source: IndexedMesh,
+        boundary_points: list[Point] | None,
+        interface_points: list[Point] | None,
+        key_precision: int,
+    ) -> IndexedMesh:
+        ids_by_key: dict[tuple[float, float], list[int]] = {}
+        for offset, (x, y) in enumerate(source.nodes):
+            ids_by_key.setdefault((round(x, key_precision), round(y, key_precision)), []).append(
+                source.index_base + offset
+            )
+
+        def ids_of(points: list[Point] | None) -> set[int]:
+            found: set[int] = set()
+            for point in points or ():
+                found.update(ids_by_key.get((round(point.x, key_precision), round(point.y, key_precision)), ()))
+            return found
+
+        return IndexedMesh(
+            nodes=list(source.nodes),
+            triangles=list(source.triangles),
+            boundary_nodes=ids_of(boundary_points),
+            interface_nodes=ids_of(interface_points),
+            bandwidth=source.bandwidth,
+            index_base=source.index_base,
+            meters_per_pixel=source.meters_per_pixel,
+            twin_groups=list(source.twin_groups),
+            triangle_subdomains=list(source.triangle_subdomains),
+        )
 
 
 def _is_positive_finite_number(value: object) -> bool:

@@ -37,8 +37,10 @@ class TestNodeClassification(unittest.TestCase):
 
         self.assertIn((0.0, 0.0), boundary_coords)
         self.assertIn((100.0, 100.0), boundary_coords)
-        self.assertIn((40.0, 40.0), interface_coords)
-        self.assertIn((60.0, 60.0), interface_coords)
+        # Hole (ignore inclusion) ring is domain boundary, not interface.
+        self.assertIn((40.0, 40.0), boundary_coords)
+        self.assertIn((60.0, 60.0), boundary_coords)
+        self.assertEqual(interface_coords, set())
 
         interior_ids = {
             node_id
@@ -68,7 +70,7 @@ class TestNodeClassification(unittest.TestCase):
         for point in boundary:
             self.assertIn((point.x, point.y), boundary_coords)
 
-    def test_multiple_holes_collect_all_interface_nodes(self) -> None:
+    def test_multiple_holes_collect_all_boundary_nodes(self) -> None:
         mesher = AdvancingFrontMesher(min_triangle_quality=0.0, target_edge_length=10.0, smoothing_iterations=0)
         boundary = [
             Point(0.0, 0.0),
@@ -86,12 +88,13 @@ class TestNodeClassification(unittest.TestCase):
 
         self.assertIsNotNone(indexed)
         assert indexed is not None
-        interface_coords = self._coords_for_ids(indexed, indexed.interface_nodes)
+        boundary_coords = self._coords_for_ids(indexed, indexed.boundary_nodes)
 
-        self.assertIn((20.0, 20.0), interface_coords)
-        self.assertIn((40.0, 40.0), interface_coords)
-        self.assertIn((90.0, 20.0), interface_coords)
-        self.assertIn((115.0, 45.0), interface_coords)
+        self.assertIn((20.0, 20.0), boundary_coords)
+        self.assertIn((40.0, 40.0), boundary_coords)
+        self.assertIn((90.0, 20.0), boundary_coords)
+        self.assertIn((115.0, 45.0), boundary_coords)
+        self.assertEqual(indexed.interface_nodes, set())
 
     def test_laplacian_smooth_keeps_boundary_and_interface_nodes_fixed(self) -> None:
         nodes = [

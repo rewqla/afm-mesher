@@ -3,15 +3,18 @@ from __future__ import annotations
 import heapq
 from collections import defaultdict
 from datetime import datetime
-from math import ceil, sqrt
+from math import ceil, floor, sqrt
 from pathlib import Path
+from time import monotonic, perf_counter
 
 from src.application.services.mesh_postprocessing import (
+    improve_mesh_by_edge_flips,
     laplacian_smooth as postprocess_laplacian_smooth,
     renumber_nodes_rcm_multistart,
     renumber_nodes_rcm,
     renumber_nodes_sloan,
     renumber_nodes_sloan_multistart,
+    split_cut_nodes,
 )
 from src.domain.entities.indexed_mesh import IndexedMesh
 from src.domain.entities.mesh import Mesh
@@ -22,6 +25,7 @@ from src.domain.geometry.geometry_utils import (
     orientation,
     point_in_polygon,
     segments_intersect,
+    triangle_area,
     triangle_quality,
 )
 from src.domain.interfaces.imesh_generator import IMeshGenerator
@@ -36,6 +40,63 @@ _MAX_EAR_DIAGONAL_FACTOR = 2.4
 _MAX_FRONT_CANDIDATE_SCAN = 256
 _MAX_DOMAIN_FRONT_POINTS = 240
 _AFM_DEBUG_LOG_PATH = Path.cwd() / "triangulation_debug.log"
+DEFAULT_TIME_BUDGET_S = 120.0
+# Relative tolerance for "sum of triangle areas == domain area".
+_AREA_RELATIVE_TOLERANCE = 1e-6
+# Distance (px) under which a point counts as lying on a cut segment / triangle edge.
+_CUT_TOUCH_TOLERANCE = 1e-6
+# Vertex-on-edge tolerance (pixels, scaled by edge length) for conformity checks.
+_ON_EDGE_RELATIVE_TOLERANCE = 1e-7
+# Runaway-front guard. A healthy front may grow several times beyond its initial size on fine
+# meshes, but it cannot have more edges than a full mesh of the domain with step h (~3*area/h^2).
+_MAX_FRONT_GROWTH_FACTOR = 4.0
+_MAX_FRONT_GROWTH_MARGIN = 64
+_MAX_FRONT_EDGES_PER_CELL = 2.0
+# A Steiner point closer than this (times the target step) to a front vertex is replaced by that vertex.
+_STEINER_SNAP_FACTOR = 0.5
+# Topology cleanup: rounds of (edge flips, valence-3 node removal) and the minimum quality of the
+# triangle that replaces three triangles around an interior valence-3 node.
+_TOPOLOGY_ROUNDS = 4
+_VALENCE3_MERGE_MIN_QUALITY = 0.3
+
+
+class MeshingTimeoutError(ValueError):
+    """Triangulation exceeded its time budget (all passes and cut variants together)."""
+
+
+class _TriangleSpatialIndex:
+    """Uniform grid over triangle bounding boxes for local overlap queries."""
+
+    def __init__(self, cell_size: float) -> None:
+        self._cell_size = max(cell_size, 1e-6)
+        self._cells: dict[tuple[int, int], list[int]] = defaultdict(list)
+        self.triangles: list[tuple[Point, Point, Point]] = []
+
+    def _cell_range(self, points: tuple[Point, ...]) -> tuple[int, int, int, int]:
+        c = self._cell_size
+        return (
+            floor(min(p.x for p in points) / c),
+            floor(max(p.x for p in points) / c),
+            floor(min(p.y for p in points) / c),
+            floor(max(p.y for p in points) / c),
+        )
+
+    def insert(self, a: Point, b: Point, c: Point) -> int:
+        idx = len(self.triangles)
+        self.triangles.append((a, b, c))
+        x0, x1, y0, y1 = self._cell_range((a, b, c))
+        for gx in range(x0, x1 + 1):
+            for gy in range(y0, y1 + 1):
+                self._cells[(gx, gy)].append(idx)
+        return idx
+
+    def query(self, a: Point, b: Point, c: Point) -> set[int]:
+        x0, x1, y0, y1 = self._cell_range((a, b, c))
+        found: set[int] = set()
+        for gx in range(x0, x1 + 1):
+            for gy in range(y0, y1 + 1):
+                found.update(self._cells.get((gx, gy), ()))
+        return found
 
 
 def _afm_debug(event: str, **fields: object) -> None:
@@ -58,6 +119,7 @@ class AdvancingFrontMesher(IMeshGenerator):
             target_edge_length: float | None = None,
             smoothing_iterations: int = 5,
             numbering_strategy: str = "rcm_multistart",
+            time_budget_s: float | None = DEFAULT_TIME_BUDGET_S,
     ) -> None:
         if not 0.0 <= min_triangle_quality <= 1.0:
             raise ValueError("min_triangle_quality must be in [0, 1]")
@@ -67,6 +129,8 @@ class AdvancingFrontMesher(IMeshGenerator):
             raise ValueError("target_edge_length must be > 0 when provided")
         if not 0 <= smoothing_iterations <= 20:
             raise ValueError("smoothing_iterations must be in [0, 20]")
+        if time_budget_s is not None and time_budget_s <= 0:
+            raise ValueError("time_budget_s must be > 0 when provided")
 
         self._min_triangle_quality = min_triangle_quality
         self._max_iterations_factor = max_iterations_factor
@@ -75,6 +139,12 @@ class AdvancingFrontMesher(IMeshGenerator):
         self._numbering_strategy = numbering_strategy
         self._steiner_activation_length_factor = 0.95
         self._debug_progress_interval = 250
+        self._time_budget_s = time_budget_s
+        self._deadline: float | None = None
+        # Triangles already built in the current AFM pass; None outside of a pass.
+        self._built_index: _TriangleSpatialIndex | None = None
+        # Seconds per stage of the last generate_with_holes_and_cuts call (all passes, failed ones too).
+        self.last_stage_timings: dict[str, float] = {"afm": 0.0, "postprocess": 0.0, "numbering": 0.0}
 
     def generate(self, boundary: list[Point]) -> Mesh:
         return self.generate_with_holes(boundary, holes=[])
@@ -92,11 +162,31 @@ class AdvancingFrontMesher(IMeshGenerator):
             boundary: list[Point],
             holes: list[list[Point]],
             cuts: list[list[Point]],
+            deadline: float | None = None,
+            merge_inclusions: list[list[Point]] | None = None,
     ) -> Mesh:
+        """`deadline` (time.monotonic()) lets a caller share one time budget across several calls;
+        without it the mesher's own `time_budget_s` applies to this call.
+
+        `merge_inclusions` are meshed together with the domain: each ring's edges enter the front in
+        both directions (like a cut), so both sides share the discretized boundary; its nodes are
+        split into outside/inside twins and every triangle gets a subdomain number (0 outside, k for
+        the k-th inclusion)."""
+        if deadline is None and self._time_budget_s is not None:
+            deadline = monotonic() + self._time_budget_s
+        self._deadline = deadline
+        timings = self.last_stage_timings = {"afm": 0.0, "postprocess": 0.0, "numbering": 0.0}
         polygon = self._prepare_boundary(boundary)
         hole_polygons = [self._prepare_hole_boundary(hole) for hole in holes if hole]
+        merge_polygons = [self._prepare_boundary(ring) for ring in (merge_inclusions or []) if ring]
         cut_segments = self._prepare_cuts(cuts, polygon, hole_polygons, tolerance=max(_EPSILON * 100.0, 1e-6))
+        # A cut endpoint lying inside a boundary edge must become a boundary vertex; otherwise the
+        # boundary front edge passes through the cut (T-junction) and the front cannot close.
+        cut_points = [p for segment in cut_segments for p in segment]
+        polygon = self._insert_points_on_edges(polygon, cut_points)
+        hole_polygons = [self._insert_points_on_edges(hole, cut_points) for hole in hole_polygons]
         base_h = self._resolve_target_step(polygon)
+        interface_segments = [edge for ring in merge_polygons for edge in self._polygon_edges(ring)]
 
         best_mesh: Mesh | None = None
         best_quality = -1.0
@@ -106,26 +196,57 @@ class AdvancingFrontMesher(IMeshGenerator):
         last_error: ValueError | None = None
         for target_scale in attempt_scales:
             target_h = base_h * target_scale
+            stage_start = perf_counter()
             try:
                 mesh, outer_boundary_points, interface_points, pass_cut_segments = self._generate_single_pass(
                     polygon,
                     hole_polygons,
-                    cut_segments,
+                    [*cut_segments, *interface_segments],
                     target_h,
                 )
+            except MeshingTimeoutError:
+                raise
             except ValueError as error:
                 last_error = error
                 continue
+            finally:
+                timings["afm"] += perf_counter() - stage_start
 
+            # Postprocessing time excludes the renumbering done inside smooth(), which is timed separately.
+            stage_start = perf_counter()
+            numbering_before = timings["numbering"]
+            mesh = self._improve_topology(
+                mesh,
+                fixed_points=[*outer_boundary_points, *interface_points],
+                cut_segments=pass_cut_segments,
+            )
             mesh = self.smooth(
                 mesh,
                 boundary=outer_boundary_points,
                 interface_points=interface_points,
                 iterations=self._smoothing_iterations,
+                cut_segments=pass_cut_segments,
             )
             self._validate_cut_segments_are_mesh_edges(mesh, pass_cut_segments)
+            try:
+                self._validate_final_mesh(mesh, self._domain_area(polygon, hole_polygons))
+            except ValueError as error:
+                _afm_debug("afm.final_validation.failed", target_h=target_h, error=str(error))
+                last_error = error
+                continue
+            finally:
+                timings["postprocess"] += perf_counter() - stage_start - (timings["numbering"] - numbering_before)
             avg_quality = self._average_mesh_quality(mesh)
 
+            # Same per-segment subdivision as in the pass, so ring pieces are recognised by key.
+            pass_interface = self._subdivide_cut_segments(interface_segments, target_h)
+            interface_keys = {self._undirected_edge_key(edge) for edge in pass_interface}
+            mesh.cut_edges = tuple(e for e in pass_cut_segments if self._undirected_edge_key(e) not in interface_keys)
+            mesh.interface_edges = tuple(pass_interface)
+            if merge_polygons and mesh.indexed_mesh_data is not None:
+                mesh.indexed_mesh_data.triangle_subdomains = self._triangle_subdomains(
+                    mesh.indexed_mesh_data, merge_polygons
+                )
             if avg_quality > best_quality:
                 best_quality = avg_quality
                 best_mesh = mesh
@@ -134,9 +255,12 @@ class AdvancingFrontMesher(IMeshGenerator):
 
         if best_mesh is None and not hole_polygons and not cut_segments:
             # Last resort for simple domain: robust ear clipping on outer boundary.
+            stage_start = perf_counter()
             fallback = self._ear_clip_polygon(polygon, polygon, holes=[], cut_segments=[])
+            timings["afm"] += perf_counter() - stage_start
             if fallback:
                 fallback_mesh = Mesh(triangles=fallback)
+                self._validate_final_mesh(fallback_mesh, self._domain_area(polygon, []))
                 return self._apply_rcm_numbering(fallback_mesh, boundary=polygon, interface_points=[])
 
         if best_mesh is None:
@@ -162,6 +286,14 @@ class AdvancingFrontMesher(IMeshGenerator):
             front.append((a, b))
             front.append((b, a))
         triangles: list[Triangle] = []
+        domain_area = self._domain_area(polygon, holes)
+        area_limit = domain_area * (1.0 + _AREA_RELATIVE_TOLERANCE) + _EPSILON
+        meshed_area = 0.0
+        front_limit = max(
+            int(len(front) * _MAX_FRONT_GROWTH_FACTOR) + _MAX_FRONT_GROWTH_MARGIN,
+            int(_MAX_FRONT_EDGES_PER_CELL * domain_area / (target_h * target_h)),
+        )
+        self._built_index = _TriangleSpatialIndex(cell_size=target_h * 1.5)
 
         max_iterations = max(200, len(front) * self._max_iterations_factor)
         iterations = 0
@@ -175,36 +307,50 @@ class AdvancingFrontMesher(IMeshGenerator):
             max_iterations=max_iterations,
         )
 
-        while front and iterations < max_iterations:
-            if iterations == 0 or iterations % self._debug_progress_interval == 0:
-                _afm_debug(
-                    "afm.single_pass.progress",
-                    iteration=iterations,
-                    front_edges=len(front),
-                    triangles=len(triangles),
-                )
-            advancement = self._find_advancement(front, polygon, holes, pass_cut_segments, target_h)
-            if advancement is None:
-                self._log_stall_diagnostics(front, polygon, holes, pass_cut_segments, target_h)
-                fallback_triangles = self._fallback_triangulate_front(front, polygon, holes, pass_cut_segments)
-                if not fallback_triangles:
-                    raise ValueError("AFM stalled: active front cannot be advanced further.")
-                triangles.extend(fallback_triangles)
-                _afm_debug(
-                    "afm.single_pass.fallback_success",
-                    fallback_triangles=len(fallback_triangles),
-                    total_triangles=len(triangles),
-                )
-                front.clear()
-                break
+        try:
+            while front and iterations < max_iterations:
+                self._check_deadline()
+                if iterations == 0 or iterations % self._debug_progress_interval == 0:
+                    _afm_debug(
+                        "afm.single_pass.progress",
+                        iteration=iterations,
+                        front_edges=len(front),
+                        triangles=len(triangles),
+                    )
+                advancement = self._find_advancement(front, polygon, holes, pass_cut_segments, target_h)
+                if advancement is None:
+                    self._log_stall_diagnostics(front, polygon, holes, pass_cut_segments, target_h)
+                    fallback_triangles = self._fallback_triangulate_front(front, polygon, holes, pass_cut_segments)
+                    if not fallback_triangles:
+                        raise ValueError("AFM stalled: active front cannot be advanced further.")
+                    triangles.extend(fallback_triangles)
+                    meshed_area += sum(t.area() for t in fallback_triangles)
+                    _afm_debug(
+                        "afm.single_pass.fallback_success",
+                        fallback_triangles=len(fallback_triangles),
+                        total_triangles=len(triangles),
+                    )
+                    front.clear()
+                    break
 
-            active_idx, a, b, candidate = advancement
-            front.pop(active_idx)
+                active_idx, a, b, candidate = advancement
+                front.pop(active_idx)
 
-            triangles.append(Triangle(a, b, candidate))
-            self._update_front(front, (a, candidate))
-            self._update_front(front, (candidate, b))
-            iterations += 1
+                triangle = Triangle(a, b, candidate)
+                triangles.append(triangle)
+                self._built_index.insert(a, b, candidate)
+                meshed_area += triangle.area()
+                self._update_front(front, (a, candidate))
+                self._update_front(front, (candidate, b))
+                iterations += 1
+                if meshed_area > area_limit:
+                    _afm_debug("afm.single_pass.area_overflow", meshed_area=meshed_area, domain_area=domain_area)
+                    raise ValueError("AFM overlapped already meshed area: triangle area exceeds domain area.")
+                if len(front) > front_limit:
+                    _afm_debug("afm.single_pass.front_overflow", front_edges=len(front), front_limit=front_limit)
+                    raise ValueError("AFM front grew beyond the safe limit (runaway front).")
+        finally:
+            self._built_index = None
 
         if front:
             _afm_debug(
@@ -218,13 +364,13 @@ class AdvancingFrontMesher(IMeshGenerator):
         if not triangles:
             raise ValueError("AFM failed to generate mesh.")
 
+        # A hole (ignore inclusion) is meshed from one side only, so its ring is domain boundary.
         outer_boundary_points = [*polygon]
-        interface_points: list[Point] = []
         for hole in holes:
-            interface_points.extend(hole)
+            outer_boundary_points.extend(hole)
+        interface_points: list[Point] = []
         for a, b in pass_cut_segments:
-            # Cuts are internal constrained segments. They are fixed like inclusion
-            # boundaries, so they are tracked as interface nodes rather than outer boundary.
+            # Cuts and merge-inclusion rings are glued from both sides: interface nodes.
             interface_points.append(a)
             interface_points.append(b)
         _afm_debug("afm.single_pass.done", triangles=len(triangles))
@@ -367,6 +513,8 @@ class AdvancingFrontMesher(IMeshGenerator):
 
         if self._contains_front_vertex(a, b, c, front):
             return "contains_front_vertex"
+        if self._overlaps_built_triangles(a, b, c):
+            return "overlaps_built_triangles"
         return None
 
     def _prepare_boundary(self, boundary: list[Point]) -> list[Point]:
@@ -563,6 +711,8 @@ class AdvancingFrontMesher(IMeshGenerator):
         # Recovery path: if no candidate found for edge direction (a->b),
         # try reversed orientation (b->a). This helps on residual fronts
         # where local edge orientation becomes inconsistent near closure.
+        # The reversed triangle passes the same validation (including the overlap
+        # check against built triangles), so it cannot re-fill already meshed area.
         for idx in sorted_indices:
             a, b = front[idx]
             candidate = self._find_best_node(
@@ -608,6 +758,28 @@ class AdvancingFrontMesher(IMeshGenerator):
         # 1) Prefer interior growth via Steiner points.
         if edge_len > target_step * self._steiner_activation_length_factor:
             for p in self._steiner_candidates(a, b):
+                snapped = self._nearest_front_vertex(
+                    p,
+                    radius=_STEINER_SNAP_FACTOR * target_step,
+                    exclude=(a, b),
+                    front=front,
+                    spatial_index=front_spatial_index,
+                    cell_size=front_cell_size,
+                )
+                if snapped is not None:
+                    if self._is_reasonable_closure_candidate(a, b, snapped, edge_len, max_ratio=1.8) and self._is_valid_triangle(
+                            a,
+                            b,
+                            snapped,
+                            polygon,
+                            holes,
+                            cut_segments,
+                            front,
+                            front_spatial_index=front_spatial_index,
+                            front_cell_size=front_cell_size,
+                    ):
+                        return snapped
+                    continue
                 if self._is_too_close_to_existing_edges(
                         p,
                         front,
@@ -629,9 +801,18 @@ class AdvancingFrontMesher(IMeshGenerator):
                 ):
                     return p
 
+        # Distances to the edge midpoint are computed once and shared by the near (radius L)
+        # and far (radius 2.5L) closure passes; the stable sort keeps the original order.
+        closure_radius = edge_len * 2.5
+        by_distance: list[tuple[float, Point]] = []
+        for p in existing_vertices:
+            d = sqrt((midpoint.x - p.x) ** 2 + (midpoint.y - p.y) ** 2)
+            if d <= closure_radius:
+                by_distance.append((d, p))
+        by_distance.sort(key=lambda item: item[0])
+
         # 2) Try to close topology with existing nodes within local radius L.
-        near_vertices = [p for p in existing_vertices if distance(p, midpoint) <= edge_len + _EPSILON]
-        near_vertices.sort(key=lambda p: distance(p, midpoint))
+        near_vertices = [p for d, p in by_distance if d <= edge_len + _EPSILON]
         for p in near_vertices:
             if not self._is_reasonable_closure_candidate(a, b, p, edge_len, max_ratio=1.8):
                 continue
@@ -649,9 +830,7 @@ class AdvancingFrontMesher(IMeshGenerator):
                 return p
 
         # 3) Wider closure radius for final wave connection.
-        closure_radius = edge_len * 2.5
-        far_vertices = [p for p in existing_vertices if distance(p, midpoint) <= closure_radius]
-        far_vertices.sort(key=lambda p: distance(p, midpoint))
+        far_vertices = [p for _, p in by_distance]
         for p in far_vertices:
             if not self._is_reasonable_closure_candidate(a, b, p, edge_len, max_ratio=2.2):
                 continue
@@ -719,7 +898,9 @@ class AdvancingFrontMesher(IMeshGenerator):
         height = sqrt(3.0) * edge_len / 2.0
 
         candidates: list[Point] = []
-        for h_scale in (1.0, 0.75, 0.5):
+        # Low apexes (0.5 of the ideal height) gave flat triangles that neighbouring edges closed
+        # onto right away, leaving interior valence-3 nodes ("triangles in triangles").
+        for h_scale in (1.0, 0.75):
             for t_shift in (0.0, 0.25, -0.25):
                 candidates.append(
                     Point(
@@ -773,6 +954,8 @@ class AdvancingFrontMesher(IMeshGenerator):
                 return False
 
         if self._contains_front_vertex(a, b, c, front):
+            return False
+        if self._overlaps_built_triangles(a, b, c):
             return False
         return True
 
@@ -828,7 +1011,32 @@ class AdvancingFrontMesher(IMeshGenerator):
                     continue
                 if segments_intersect(edge[0], edge[1], cut_segment[0], cut_segment[1], include_endpoints=False):
                     return False
+                # Touching cases `include_endpoints=False` lets through: an edge running along the cut
+                # (collinear overlap) or passing through a cut node, or a triangle vertex in a cut's interior.
+                if self._point_strictly_inside_segment(cut_segment[0], edge[0], edge[1]):
+                    return False
+                if self._point_strictly_inside_segment(cut_segment[1], edge[0], edge[1]):
+                    return False
+                if self._point_strictly_inside_segment(edge[0], cut_segment[0], cut_segment[1]):
+                    return False
+        for cut_segment in cut_segments:
+            # A cut segment starting at a triangle vertex must not run into the triangle's interior.
+            mid = Point((cut_segment[0].x + cut_segment[1].x) / 2.0, (cut_segment[0].y + cut_segment[1].y) / 2.0)
+            sides = {orientation(a, b, mid), orientation(b, c, mid), orientation(c, a, mid)}
+            if sides == {1} or sides == {-1}:
+                return False
         return True
+
+    def _point_strictly_inside_segment(self, p: Point, a: Point, b: Point) -> bool:
+        if p == a or p == b:
+            return False
+        length = distance(a, b)
+        if length <= _EPSILON:
+            return False
+        if abs((b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x)) / length > _CUT_TOUCH_TOLERANCE:
+            return False
+        t = ((p.x - a.x) * (b.x - a.x) + (p.y - a.y) * (b.y - a.y)) / (length * length)
+        return _CUT_TOUCH_TOLERANCE / length < t < 1.0 - _CUT_TOUCH_TOLERANCE / length
 
     def _polygon_edges(self, polygon: list[Point]) -> list[FrontEdge]:
         return [(polygon[i], polygon[(i + 1) % len(polygon)]) for i in range(len(polygon))]
@@ -896,11 +1104,18 @@ class AdvancingFrontMesher(IMeshGenerator):
         return list(out)
 
     def _contains_front_vertex(self, a: Point, b: Point, c: Point, front: list[FrontEdge]) -> bool:
+        """A front vertex strictly inside the triangle or inside one of its sides (hanging node)."""
         for p in self._front_vertices(front, exclude={a, b, c}):
             o1 = orientation(a, b, p)
             o2 = orientation(b, c, p)
             o3 = orientation(c, a, p)
             if o1 > 0 and o2 > 0 and o3 > 0:
+                return True
+            if o1 >= 0 and o2 >= 0 and o3 >= 0 and (
+                    self._point_inside_segment(p, a, b)
+                    or self._point_inside_segment(p, b, c)
+                    or self._point_inside_segment(p, c, a)
+            ):
                 return True
         return False
 
@@ -932,8 +1147,9 @@ class AdvancingFrontMesher(IMeshGenerator):
             boundary: list[Point],
             interface_points: list[Point] | None = None,
             iterations: int = 5,
+            cut_segments: list[Segment] | None = None,
     ) -> Mesh:
-        return self._laplacian_smooth(mesh, boundary, interface_points or [], iterations)
+        return self._laplacian_smooth(mesh, boundary, interface_points or [], iterations, cut_segments or [])
 
     def _laplacian_smooth(
             self,
@@ -941,14 +1157,17 @@ class AdvancingFrontMesher(IMeshGenerator):
             boundary: list[Point],
             interface_points: list[Point],
             iterations: int,
+            cut_segments: list[Segment] | None = None,
     ) -> Mesh:
+        # Smoothing works on the coordinate-glued topology (cut nodes are fixed interface nodes);
+        # cut nodes are split into per-side twins only afterwards, in _apply_rcm_numbering.
         node_positions, triangles, _, _, boundary_ids, interface_ids = self._build_topology(
             mesh,
             boundary,
             interface_points,
         )
         if not node_positions:
-            return self._apply_rcm_numbering(mesh)
+            return self._apply_rcm_numbering(mesh, cut_segments=cut_segments)
 
         ordered_node_ids = sorted(node_positions)
         nodes = [(node_positions[node_id].x, node_positions[node_id].y) for node_id in ordered_node_ids]
@@ -972,6 +1191,7 @@ class AdvancingFrontMesher(IMeshGenerator):
             smoothed_mesh,
             boundary=boundary,
             interface_points=interface_points,
+            cut_segments=cut_segments,
         )
 
     def _apply_rcm_numbering(
@@ -980,6 +1200,7 @@ class AdvancingFrontMesher(IMeshGenerator):
         boundary: list[Point] | None = None,
         interface_points: list[Point] | None = None,
         numbering_strategy: str | None = None,
+        cut_segments: list[Segment] | None = None,
     ) -> Mesh:
         linear_triangles = mesh.linear_triangles(key_precision=_KEY_PRECISION)
         node_coordinates_by_id: dict[int, tuple[float, float]] = {}
@@ -991,7 +1212,11 @@ class AdvancingFrontMesher(IMeshGenerator):
                 node_coordinates_by_id.setdefault(node_id, (point.x, point.y))
 
         ordered_nodes = [node_coordinates_by_id[node_id] for node_id in sorted(node_coordinates_by_id)]
+        ordered_nodes, indexed_triangles, twin_groups = self._split_cut_nodes(
+            ordered_nodes, indexed_triangles, cut_segments or []
+        )
         numbering_strategy = self._numbering_strategy if numbering_strategy is None else numbering_strategy
+        numbering_start = perf_counter()
         if numbering_strategy == "rcm_multistart":
             rcm_nodes, rcm_triangles, bandwidth = renumber_nodes_rcm_multistart(ordered_nodes, indexed_triangles)
         elif numbering_strategy == "rcm":
@@ -1004,22 +1229,30 @@ class AdvancingFrontMesher(IMeshGenerator):
             raise ValueError(
                 "numbering_strategy must be one of 'rcm', 'rcm_multistart', 'sloan', or 'sloan_multistart'"
             )
+        self.last_stage_timings["numbering"] += perf_counter() - numbering_start
+        # Renumbering keeps the triangle order, so the old->new node map is read off the triangles.
+        old_to_new = {
+            old_id: new_id
+            for old_triangle, new_triangle in zip(indexed_triangles, rcm_triangles)
+            for old_id, new_id in zip(old_triangle, new_triangle)
+        }
+        twin_groups = [tuple(sorted(old_to_new[node_id] for node_id in group)) for group in twin_groups]
         boundary_nodes: set[int] = set()
         interface_nodes: set[int] = set()
-        node_lookup = {
-            (round(x, _KEY_PRECISION), round(y, _KEY_PRECISION)): idx
-            for idx, (x, y) in enumerate(rcm_nodes, start=1)
-        }
+        # Twins share coordinates: a point resolves to every number it has.
+        node_lookup: dict[tuple[float, float], list[int]] = defaultdict(list)
+        for idx, (x, y) in enumerate(rcm_nodes, start=1):
+            node_lookup[(round(x, _KEY_PRECISION), round(y, _KEY_PRECISION))].append(idx)
         if boundary is not None:
             for point in boundary:
-                node_id = node_lookup.get((round(point.x, _KEY_PRECISION), round(point.y, _KEY_PRECISION)))
-                if node_id is not None:
-                    boundary_nodes.add(node_id)
+                boundary_nodes.update(
+                    node_lookup.get((round(point.x, _KEY_PRECISION), round(point.y, _KEY_PRECISION)), ())
+                )
         if interface_points is not None:
             for point in interface_points:
-                node_id = node_lookup.get((round(point.x, _KEY_PRECISION), round(point.y, _KEY_PRECISION)))
-                if node_id is not None:
-                    interface_nodes.add(node_id)
+                interface_nodes.update(
+                    node_lookup.get((round(point.x, _KEY_PRECISION), round(point.y, _KEY_PRECISION)), ())
+                )
         _afm_debug("afm.postprocess.rcm", nodes=len(rcm_nodes), bandwidth=bandwidth, strategy=numbering_strategy)
         indexed_mesh = IndexedMesh(
             nodes=rcm_nodes,
@@ -1029,6 +1262,7 @@ class AdvancingFrontMesher(IMeshGenerator):
             bandwidth=bandwidth,
             index_base=1,
             meters_per_pixel=mesh.meters_per_pixel,
+            twin_groups=twin_groups,
         )
         return Mesh(
             triangles=mesh.triangles,
@@ -1036,6 +1270,38 @@ class AdvancingFrontMesher(IMeshGenerator):
             node_order=tuple(Point(x, y) for x, y in rcm_nodes),
             indexed_mesh_data=indexed_mesh,
         )
+
+    def _split_cut_nodes(
+        self,
+        nodes: list[tuple[float, float]],
+        triangles: list[tuple[int, int, int]],
+        cut_segments: list[Segment],
+    ) -> tuple[list[tuple[float, float]], list[tuple[int, int, int]], list[tuple[int, ...]]]:
+        if not cut_segments:
+            return nodes, triangles, []
+        node_ids = {
+            (round(x, _KEY_PRECISION), round(y, _KEY_PRECISION)): idx
+            for idx, (x, y) in enumerate(nodes, start=1)
+        }
+        cut_edges: set[frozenset[int]] = set()
+        for a, b in cut_segments:
+            a_id = node_ids.get(self._point_key(a))
+            b_id = node_ids.get(self._point_key(b))
+            if a_id is not None and b_id is not None:
+                cut_edges.add(frozenset((a_id, b_id)))
+        return split_cut_nodes(nodes, triangles, cut_edges)
+
+    def _triangle_subdomains(self, indexed_mesh: IndexedMesh, rings: list[list[Point]]) -> list[int]:
+        """0 for the main domain, k (1-based) for a triangle inside the k-th merge inclusion."""
+        nodes, base = indexed_mesh.nodes, indexed_mesh.index_base
+        subdomains: list[int] = []
+        for triangle in indexed_mesh.triangles:
+            xs, ys = zip(*(nodes[node_id - base] for node_id in triangle))
+            centroid = Point(sum(xs) / 3.0, sum(ys) / 3.0)
+            subdomains.append(
+                next((k for k, ring in enumerate(rings, start=1) if point_in_polygon(centroid, ring)), 0)
+            )
+        return subdomains
 
     def _average_mesh_quality(self, mesh: Mesh) -> float:
         qualities = [triangle_quality(t.a, t.b, t.c) for t in mesh.triangles]
@@ -1434,6 +1700,206 @@ class AdvancingFrontMesher(IMeshGenerator):
                     subdivided.append((prev, curr))
                 prev = curr
         return self._dedupe_segments(subdivided, tolerance=max(_EPSILON * 100.0, 1e-6))
+
+    def _insert_points_on_edges(self, polygon: list[Point], points: list[Point]) -> list[Point]:
+        result: list[Point] = []
+        n = len(polygon)
+        for i in range(n):
+            a = polygon[i]
+            b = polygon[(i + 1) % n]
+            result.append(a)
+            inner = {p for p in points if p != a and p != b and self._point_inside_segment(p, a, b)}
+            result.extend(sorted(inner, key=lambda p: distance(a, p)))
+        return result
+
+    def _nearest_front_vertex(
+            self,
+            point: Point,
+            radius: float,
+            exclude: tuple[Point, Point],
+            front: list[FrontEdge],
+            spatial_index: dict[tuple[int, int], list[int]] | None,
+            cell_size: float | None,
+    ) -> Point | None:
+        if spatial_index is not None and cell_size is not None and cell_size > _EPSILON:
+            edge_ids = self._query_segment_spatial_index(
+                spatial_index,
+                Point(point.x - radius, point.y - radius),
+                Point(point.x + radius, point.y + radius),
+                cell_size,
+            )
+            vertices = {v for idx in edge_ids for v in front[idx]}
+        else:
+            vertices = {v for edge in front for v in edge}
+        best: Point | None = None
+        best_distance = radius
+        for v in vertices:
+            if v in exclude:
+                continue
+            d = distance(point, v)
+            if d < best_distance:
+                best, best_distance = v, d
+        return best
+
+    def _improve_topology(self, mesh: Mesh, fixed_points: list[Point], cut_segments: list[Segment]) -> Mesh:
+        """Edge flips plus removal of interior valence-3 nodes. Boundary, hole and cut nodes stay;
+        cut edges are never flipped."""
+        key_to_id: dict[tuple[float, float], int] = {}
+        nodes: list[tuple[float, float]] = []
+
+        def node_id(point: Point) -> int:
+            key = self._point_key(point)
+            if key not in key_to_id:
+                key_to_id[key] = len(nodes)
+                nodes.append((point.x, point.y))
+            return key_to_id[key]
+
+        triangles = [(node_id(t.a), node_id(t.b), node_id(t.c)) for t in mesh.triangles]
+        fixed = {key_to_id[key] for key in (self._point_key(p) for p in fixed_points) if key in key_to_id}
+        locked: set[tuple[int, int]] = set()
+        for a, b in cut_segments:
+            ka, kb = self._point_key(a), self._point_key(b)
+            if ka in key_to_id and kb in key_to_id:
+                locked.add(tuple(sorted((key_to_id[ka], key_to_id[kb]))))
+
+        removed_total = 0
+        for _ in range(_TOPOLOGY_ROUNDS):
+            triangles = improve_mesh_by_edge_flips(nodes, triangles, max_passes=3, locked_edges=locked)
+            triangles, removed = self._remove_valence3_nodes(nodes, triangles, fixed)
+            removed_total += removed
+            if not removed:
+                break
+        _afm_debug("afm.topology.improved", removed_valence3=removed_total, triangles=len(triangles))
+        points = [Point(x, y) for x, y in nodes]
+        return Mesh(
+            triangles=[Triangle(points[a], points[b], points[c]) for a, b, c in triangles],
+            meters_per_pixel=mesh.meters_per_pixel,
+        )
+
+    def _remove_valence3_nodes(
+            self,
+            nodes: list[tuple[float, float]],
+            triangles: list[TriangleIds],
+            fixed: set[int],
+    ) -> tuple[list[TriangleIds], int]:
+        incident: dict[int, list[int]] = defaultdict(list)
+        for idx, triangle in enumerate(triangles):
+            for n in triangle:
+                incident[n].append(idx)
+        consumed: set[int] = set()
+        merged: list[TriangleIds] = []
+        min_quality = max(self._min_triangle_quality, _VALENCE3_MERGE_MIN_QUALITY)
+        for n, tri_ids in incident.items():
+            if n in fixed or len(tri_ids) != 3 or any(i in consumed for i in tri_ids):
+                continue
+            ring = sorted({m for i in tri_ids for m in triangles[i]} - {n})
+            if len(ring) != 3:
+                continue
+            a, b, c = (Point(*nodes[m]) for m in ring)
+            if orientation(a, b, c) < 0:
+                ring = [ring[0], ring[2], ring[1]]
+                a, b, c = (Point(*nodes[m]) for m in ring)
+            if not self._point_in_triangle_strict(Point(*nodes[n]), a, b, c):
+                continue
+            try:
+                if triangle_quality(a, b, c) < min_quality:
+                    continue
+            except ValueError:
+                continue
+            consumed.update(tri_ids)
+            merged.append((ring[0], ring[1], ring[2]))
+        if not merged:
+            return triangles, 0
+        kept = [t for i, t in enumerate(triangles) if i not in consumed]
+        return kept + merged, len(merged)
+
+    def _check_deadline(self) -> None:
+        if self._deadline is not None and monotonic() > self._deadline:
+            _afm_debug("afm.time_budget_exceeded", time_budget_s=self._time_budget_s)
+            raise MeshingTimeoutError(
+                "Тріангуляція перевищила ліміт часу. Спробуйте інший режим (наприклад, Fast) "
+                "або спростіть контури."
+            )
+
+    def _domain_area(self, polygon: list[Point], holes: list[list[Point]]) -> float:
+        return abs(self._signed_area(polygon)) - sum(abs(self._signed_area(hole)) for hole in holes)
+
+    def _overlaps_built_triangles(self, a: Point, b: Point, c: Point) -> bool:
+        index = self._built_index
+        if index is None:
+            return False
+        candidate = (a, b, c)
+        return any(self._triangles_conflict(candidate, index.triangles[i]) for i in index.query(a, b, c))
+
+    def _validate_final_mesh(self, mesh: Mesh, domain_area: float) -> None:
+        """Raise ValueError unless the triangles tile the domain: total area matches, interiors do
+        not overlap and no vertex lies inside another triangle's side (hanging node)."""
+        triangles = [(t.a, t.b, t.c) if orientation(t.a, t.b, t.c) > 0 else (t.a, t.c, t.b) for t in mesh.triangles]
+        total_area = sum(triangle_area(*t) for t in triangles)
+        if abs(total_area - domain_area) > _AREA_RELATIVE_TOLERANCE * max(domain_area, 1.0):
+            raise ValueError(
+                f"Mesh validation failed: triangle area {total_area:.6f} != domain area {domain_area:.6f}."
+            )
+        longest = max(distance(p, q) for t in triangles for p, q in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])))
+        index = _TriangleSpatialIndex(cell_size=longest)
+        for i, triangle in enumerate(triangles):
+            for j in index.query(*triangle):
+                if self._triangles_conflict(triangle, index.triangles[j]):
+                    raise ValueError(f"Mesh validation failed: triangles {j} and {i} overlap or form a hanging node.")
+            index.insert(*triangle)
+
+    def _triangles_conflict(
+            self,
+            first: tuple[Point, Point, Point],
+            second: tuple[Point, Point, Point],
+    ) -> bool:
+        """True when two CCW triangles overlap in their interiors, or a vertex of one lies strictly
+        inside the other or inside one of its sides. Sharing a vertex or an edge is fine."""
+        if (
+                max(p.x for p in first) < min(p.x for p in second)
+                or max(p.x for p in second) < min(p.x for p in first)
+                or max(p.y for p in first) < min(p.y for p in second)
+                or max(p.y for p in second) < min(p.y for p in first)
+        ):
+            return False
+        shared = [p for p in first if p in second]
+        if len(shared) == 3:
+            return True
+        if len(shared) == 2:
+            u, v = shared
+            third_first = next(p for p in first if p not in shared)
+            third_second = next(p for p in second if p not in shared)
+            if orientation(u, v, third_first) * orientation(u, v, third_second) >= 0:
+                return True
+        for this, other in ((first, second), (second, first)):
+            for p in this:
+                if p in other:
+                    continue
+                if self._point_in_triangle_strict(p, *other):
+                    return True
+                for q, r in ((other[0], other[1]), (other[1], other[2]), (other[2], other[0])):
+                    if self._point_inside_segment(p, q, r):
+                        return True
+        for p1, p2 in ((first[0], first[1]), (first[1], first[2]), (first[2], first[0])):
+            for q1, q2 in ((second[0], second[1]), (second[1], second[2]), (second[2], second[0])):
+                if self._share_endpoint((p1, p2), (q1, q2)):
+                    continue
+                if segments_intersect(p1, p2, q1, q2, include_endpoints=False):
+                    return True
+        return False
+
+    def _point_inside_segment(self, p: Point, a: Point, b: Point) -> bool:
+        dx = b.x - a.x
+        dy = b.y - a.y
+        length_sq = dx * dx + dy * dy
+        if length_sq <= _EPSILON:
+            return False
+        t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / length_sq
+        if t <= 1e-9 or t >= 1.0 - 1e-9:
+            return False
+        length = sqrt(length_sq)
+        line_distance = abs(dx * (p.y - a.y) - dy * (p.x - a.x)) / length
+        return line_distance <= _ON_EDGE_RELATIVE_TOLERANCE * max(length, 1.0)
 
     def _signed_area(self, polygon: list[Point]) -> float:
         area = 0.0

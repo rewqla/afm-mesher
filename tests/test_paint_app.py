@@ -53,6 +53,34 @@ class TestPaintApp(unittest.TestCase):
         self.assertEqual(window.width(), initial_window_size.width() - 260)
         self.assertEqual(window.height(), initial_window_size.height() - 170)
 
+    def test_inclusion_mode_choice_is_localized_and_reaches_adapter(self) -> None:
+        window = PaintApp()
+        combo = window._inclusion_combo  # noqa: SLF001
+        self.assertEqual(window.inclusion_mode(), "ignore")
+        label = window._settings_layout.labelForField(combo)  # noqa: SLF001
+        for language, title, merge_text in (
+            ("uk", "Включення:", "Тріангулювати зі склейкою"),
+            ("en", "Inclusions:", "Triangulate and glue"),
+        ):
+            window._language = language  # noqa: SLF001
+            window._retranslate_ui()  # noqa: SLF001
+            self.assertEqual(label.text(), title)
+            self.assertEqual(combo.itemText(1), merge_text)
+
+        combo.setCurrentIndex(combo.findData("merge"))
+        self.assertEqual(window.inclusion_mode(), "merge")
+        calls: list[dict] = []
+
+        class _RecordingAdapter:
+            def run_from_contours(self, contours, **kwargs):  # noqa: ANN001, ANN003
+                calls.append(kwargs)
+                return None, 0.0
+
+        window._triangulation_adapter = _RecordingAdapter()  # noqa: SLF001
+        window._contours_for_triangulation = lambda *_a, **_k: [[(0, 0), (10, 0), (0, 10), (0, 0)]]  # noqa: SLF001
+        window.run_triangulation(QImage(4, 4, QImage.Format.Format_RGB32))
+        self.assertEqual(calls[0]["inclusion_mode"], "merge")
+
     def test_resolve_custom_settings_includes_meters_per_pixel(self) -> None:
         window = PaintApp()
         for index in range(window._mode_combo.count()):  # noqa: SLF001

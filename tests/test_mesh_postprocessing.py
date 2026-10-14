@@ -95,9 +95,9 @@ class TestMeshPostprocessing(unittest.TestCase):
 
     def test_renumber_nodes_rcm_multistart_checkpoint_betas(self) -> None:
         cases = [
-            ("one.png", 15),
-            ("spot_with_circle.png", 37),
-            ("spot_with_lines.png", 37),
+            ("one.png", 13),
+            ("spot_with_circle.png", 28),
+            ("spot_with_lines.png", 28),
         ]
         for image_name, expected_beta in cases:
             with self.subTest(image=image_name):
@@ -156,9 +156,9 @@ class TestMeshPostprocessing(unittest.TestCase):
 
     def test_renumber_nodes_gps_checkpoint_betas_against_rcm_multistart(self) -> None:
         cases = [
-            ("one.png", 15, 22),
-            ("spot_with_circle.png", 37, 72),
-            ("spot_with_lines.png", 37, 72),
+            ("one.png", 13, 23),
+            ("spot_with_circle.png", 28, 49),
+            ("spot_with_lines.png", 28, 49),
         ]
         for image_name, expected_rcm_beta, expected_gps_beta in cases:
             with self.subTest(image=image_name):
@@ -172,9 +172,9 @@ class TestMeshPostprocessing(unittest.TestCase):
 
     def test_refine_numbering_local_search_is_never_worse_than_rcm_multistart(self) -> None:
         cases = [
-            ("one.png", 15),
-            ("spot_with_circle.png", 37),
-            ("spot_with_lines.png", 37),
+            ("one.png", 13),
+            ("spot_with_circle.png", 28),
+            ("spot_with_lines.png", 28),
         ]
         for image_name, expected_beta in cases:
             with self.subTest(image=image_name):
@@ -253,11 +253,12 @@ class TestMeshPostprocessing(unittest.TestCase):
             self.assertGreater(orientation(a, b, c), 0)
 
     def test_edge_flip_improves_local_diagonal_quality(self) -> None:
+        # Convex rhombus split along its long diagonal 0-2; flipping to 1-3 improves both triangles.
         nodes = [
             (0.0, 0.0),
-            (3.0, 0.0),
-            (1.5, 0.2),
-            (0.0, 2.0),
+            (2.0, -0.3),
+            (4.0, 0.0),
+            (2.0, 0.3),
         ]
         triangles = [
             (0, 1, 2),
@@ -270,6 +271,19 @@ class TestMeshPostprocessing(unittest.TestCase):
 
         self.assertGreater(after_quality, before_quality)
         self.assertEqual({tuple(sorted(tri)) for tri in flipped}, {tuple(sorted((0, 1, 3))), tuple(sorted((1, 2, 3)))})
+
+    def test_edge_flip_skips_non_convex_quad_and_locked_edges(self) -> None:
+        # Node 2 lies inside triangle 0-1-3, so flipping 0-2 would create overlapping triangles.
+        nodes = [(0.0, 0.0), (3.0, 0.0), (1.5, 0.2), (0.0, 2.0)]
+        triangles = [(0, 1, 2), (0, 2, 3)]
+        self.assertEqual(improve_mesh_by_edge_flips(nodes, triangles), triangles)
+
+        rhombus = [(0.0, 0.0), (2.0, -0.3), (4.0, 0.0), (2.0, 0.3)]
+        rhombus_triangles = [(0, 1, 2), (0, 2, 3)]
+        self.assertEqual(
+            improve_mesh_by_edge_flips(rhombus, rhombus_triangles, locked_edges={(0, 2)}),
+            rhombus_triangles,
+        )
 
 
 def _mean_quality(nodes: list[tuple[float, float]], triangles: list[tuple[int, int, int]]) -> float:

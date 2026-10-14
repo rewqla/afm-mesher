@@ -62,6 +62,68 @@ def renumber_triangles(
     ]
 
 
+def split_cut_nodes(
+    nodes: list[Node],
+    triangles: list[TriangleIndices],
+    cut_edges: set[frozenset[int]],
+) -> tuple[list[Node], list[TriangleIndices], list[tuple[int, ...]]]:
+    """Give every node on a cut one number per sector of its triangle fan (1-based indices).
+
+    `cut_edges` are all separating edges: cut segments and merge-inclusion boundary segments (a node
+    on an inclusion boundary gets 2 numbers, outside/inside).
+    Triangles around a cut node are grouped into sectors connected through non-cut edges; the first
+    sector keeps the original number, the others get new numbers with the same coordinates. An
+    interior cut node gets 2 numbers, a cut tip inside the domain 1, a cut end on the outer boundary
+    2, a junction of several cuts one per sector. Returns new nodes, triangles and the twin groups.
+    """
+    cut_nodes = {node_id for edge in cut_edges for node_id in edge}
+    if not cut_nodes:
+        return list(nodes), list(triangles), []
+
+    incident: dict[int, list[int]] = {node_id: [] for node_id in cut_nodes}
+    for tri_idx, triangle in enumerate(triangles):
+        for node_id in triangle:
+            if node_id in incident:
+                incident[node_id].append(tri_idx)
+
+    new_nodes = list(nodes)
+    new_triangles = [list(triangle) for triangle in triangles]
+    twin_groups: list[tuple[int, ...]] = []
+    for node_id in sorted(cut_nodes):
+        fan = incident[node_id]
+        parent = {tri_idx: tri_idx for tri_idx in fan}
+
+        def find(tri_idx: int) -> int:
+            while parent[tri_idx] != tri_idx:
+                parent[tri_idx] = parent[parent[tri_idx]]
+                tri_idx = parent[tri_idx]
+            return tri_idx
+
+        by_spoke: dict[int, list[int]] = {}
+        for tri_idx in fan:
+            for other in triangles[tri_idx]:
+                if other != node_id and frozenset((node_id, other)) not in cut_edges:
+                    by_spoke.setdefault(other, []).append(tri_idx)
+        for sharing in by_spoke.values():
+            for tri_idx in sharing[1:]:
+                parent[find(tri_idx)] = find(sharing[0])
+
+        sectors: dict[int, list[int]] = {}
+        for tri_idx in fan:
+            sectors.setdefault(find(tri_idx), []).append(tri_idx)
+        if len(sectors) < 2:
+            continue
+        group = [node_id]
+        for sector in list(sectors.values())[1:]:
+            new_nodes.append(nodes[node_id - 1])
+            twin_id = len(new_nodes)
+            group.append(twin_id)
+            for tri_idx in sector:
+                new_triangles[tri_idx] = [twin_id if n == node_id else n for n in new_triangles[tri_idx]]
+        twin_groups.append(tuple(group))
+    return new_nodes, [tuple(triangle) for triangle in new_triangles], twin_groups
+
+
 def renumber_nodes_rcm(
     nodes: list[tuple[float, float]],
     triangles: list[tuple[int, int, int]],
@@ -452,7 +514,10 @@ def improve_mesh_by_edge_flips(
     triangles: list[tuple[int, int, int]],
     max_passes: int = 3,
     tolerance: float = 1e-9,
+    locked_edges: set[tuple[int, int]] | None = None,
 ) -> list[tuple[int, int, int]]:
+    """Flip interior edges when it improves quality. `locked_edges` (same index base as
+    `triangles`) are constrained edges, e.g. cut segments, that must never be flipped."""
     if max_passes < 0:
         raise ValueError("max_passes must be >= 0")
     if not nodes or not triangles or max_passes == 0:
@@ -461,6 +526,7 @@ def improve_mesh_by_edge_flips(
     normalized_triangles, index_base = _normalize_triangle_indices(triangles, len(nodes))
     positions = [Point(float(x), float(y)) for x, y in nodes]
     current = list(normalized_triangles)
+    locked = {tuple(sorted((a - index_base, b - index_base))) for a, b in (locked_edges or ())}
 
     for _ in range(max_passes):
         changed = False
@@ -468,7 +534,7 @@ def improve_mesh_by_edge_flips(
         locked_triangles: set[int] = set()
 
         for edge, triangle_indices in edge_to_triangles.items():
-            if len(triangle_indices) != 2:
+            if len(triangle_indices) != 2 or edge in locked:
                 continue
 
             first_idx, second_idx = triangle_indices
@@ -483,8 +549,18 @@ def improve_mesh_by_edge_flips(
 
             if first_other == second_other:
                 continue
+            # Flip only inside a strictly convex quad: the new diagonal must separate the old edge ends.
+            p_first, p_second = positions[first_other], positions[second_other]
+            if orientation(p_first, p_second, positions[edge[0]]) * orientation(
+                p_first, p_second, positions[edge[1]]
+            ) >= 0:
+                continue
+            if orientation(positions[edge[0]], positions[edge[1]], p_first) * orientation(
+                positions[edge[0]], positions[edge[1]], p_second
+            ) >= 0:
+                continue
 
-            old_quality = _triangle_quality_tuple(first, positions, tolerance) + _triangle_quality_tuple(second, positions, tolerance)
+            old_quality = _pair_quality(first, second, positions, tolerance)
             candidate_first = _orient_triangle(first_other, second_other, edge[0], positions, tolerance)
             candidate_second = _orient_triangle(second_other, first_other, edge[1], positions, tolerance)
             if candidate_first is None or candidate_second is None:
@@ -492,7 +568,7 @@ def improve_mesh_by_edge_flips(
             if len({*candidate_first}) < 3 or len({*candidate_second}) < 3:
                 continue
 
-            new_quality = _triangle_quality_tuple(candidate_first, positions, tolerance) + _triangle_quality_tuple(candidate_second, positions, tolerance)
+            new_quality = _pair_quality(candidate_first, candidate_second, positions, tolerance)
             if not _quality_tuple_is_better(new_quality, old_quality, tolerance):
                 continue
 
@@ -1489,6 +1565,18 @@ def _local_quality_tuple(
     if not qualities:
         return (-1.0, -1.0)
     return (min(qualities), sum(qualities) / len(qualities))
+
+
+def _pair_quality(
+    first: TriangleIndices,
+    second: TriangleIndices,
+    positions: list[Point],
+    tolerance: float,
+) -> tuple[float, float]:
+    """(worst quality, total quality) of two triangles — flips maximize the worst one first."""
+    q_first = _triangle_quality_tuple(first, positions, tolerance)[0]
+    q_second = _triangle_quality_tuple(second, positions, tolerance)[0]
+    return (min(q_first, q_second), q_first + q_second)
 
 
 def _quality_tuple_is_better(

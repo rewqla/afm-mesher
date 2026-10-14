@@ -34,6 +34,10 @@ def save_debug_visualization(
         ys = [triangle.a.y, triangle.b.y, triangle.c.y, triangle.a.y]
         ax.plot(xs, ys, color="deepskyblue", linewidth=0.6, alpha=0.85)
 
+    # Draw the cut as the mesher constrained it (a chain of mesh edges), not the raw stroke.
+    for start, end in mesh.cut_edges:
+        ax.plot([start.x, end.x], [start.y, end.y], color="black", linewidth=1.6)
+
     # Draw simplified boundary on top for easier debugging.
     if boundary:
         boundary_x = [point.x for point in boundary] + [boundary[0].x]
