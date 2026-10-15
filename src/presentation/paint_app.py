@@ -120,6 +120,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "inclusions": "Включення:",
         "inclusion_ignore": "Не враховувати",
         "inclusion_merge": "Тріангулювати зі склейкою",
+        "tri_warnings_title": "Тріангуляція: не все враховано",
         "time_done": "Час: {total}",
         "time_failed": "Час до помилки: {total}",
         "time_stages": "контури {contours} · AFM {afm} · постобробка {postprocess} · нумерація {numbering}",
@@ -174,6 +175,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "inclusions": "Inclusions:",
         "inclusion_ignore": "Ignore",
         "inclusion_merge": "Triangulate and glue",
+        "tri_warnings_title": "Triangulation: some geometry was not used",
         "time_done": "Time: {total}",
         "time_failed": "Time until error: {total}",
         "time_stages": "contours {contours} · AFM {afm} · postprocessing {postprocess} · numbering {numbering}",
@@ -1715,6 +1717,9 @@ class PaintApp(QMainWindow):
         self._set_triangulation_busy(False)
         self._last_triangulation_time = (True, self._elapsed_since_triangulation_start(), getattr(mesh, "timings", None))
         self.display_triangulation_result(mesh, coefficient)
+        warnings = getattr(mesh, "warnings", ())
+        if warnings:
+            QMessageBox.warning(self, self._t("tri_warnings_title"), "\n\n".join(warnings))
 
     def _on_triangulation_failed(self, message: str) -> None:
         self._set_triangulation_busy(False)

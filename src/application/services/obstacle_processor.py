@@ -8,6 +8,7 @@ from src.infrastructure.processing.image_boundary_extractor import extract_conto
 from src.infrastructure.image.photo_preprocessor import simplify_contour
 
 from math import ceil, floor
+import numpy as np
 from PIL import Image, ImageDraw
 
 try:
@@ -232,13 +233,7 @@ class ObstacleProcessor:
             if len(polygon) >= 3:
                 draw.polygon(polygon, fill=1, outline=1)
 
-        mask: list[list[int]] = []
-        for y in range(height):
-            row: list[int] = []
-            for x in range(width):
-                row.append(1 if image.getpixel((x, y)) else 0)
-            mask.append(row)
-        return mask
+        return (np.asarray(image, dtype=bool)).astype(np.int64).tolist()
 
     def _shift_contour(self, contour: list[tuple[int, int]], min_x: int, min_y: int) -> list[Point]:
         return [Point(float(x + min_x), float(y + min_y)) for x, y in contour]

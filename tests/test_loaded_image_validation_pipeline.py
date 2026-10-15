@@ -389,9 +389,10 @@ class TestLoadedImageValidationPipeline(unittest.TestCase):
 
         parts = self.adapter._split_cut_by_hole_conflicts(cut, [hole])  # noqa: SLF001
 
+        # Pieces end exactly on the hole boundary, so the mesher attaches them to the hole ring.
         self.assertEqual(len(parts), 2)
-        self.assertTrue(parts[0][0].x < 30.0 and parts[0][1].x < 30.0)
-        self.assertTrue(parts[1][0].x > 70.0 and parts[1][1].x > 70.0)
+        self.assertEqual((parts[0][0].x, parts[0][1].x), (10.0, 30.0))
+        self.assertEqual((parts[1][0].x, parts[1][1].x), (70.0, 90.0))
 
     def test_adapter_merges_overlapping_collinear_cuts(self) -> None:
         cuts = [

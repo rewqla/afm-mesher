@@ -224,6 +224,7 @@ class Canvas(QWidget):
 
     def set_mesh_overlay(self, mesh: Mesh | None) -> None:
         self._mesh_overlay = mesh
+        self._mesh_lines = None
         self.update()
 
     def mesh_overlay(self) -> Mesh | None:
@@ -532,26 +533,38 @@ class Canvas(QWidget):
         painter.drawImage(0, 0, self._image)
         painter.setOpacity(1.0)
 
-    def _draw_mesh_overlay(self, painter: QPainter, mesh: Mesh) -> None:
-        pen = QPen(Qt.GlobalColor.red, 1, Qt.PenStyle.SolidLine)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
+    def _mesh_overlay_lines(self, mesh: Mesh) -> tuple[list[QLineF], list[QLineF], list[QLineF]]:
+        # Built once per mesh: triangle sides, cut edges and merge-inclusion edges, in drawing order.
+        cached = getattr(self, "_mesh_lines", None)
+        if cached is not None and cached[0] is mesh:
+            return cached[1]
+        triangle_lines: list[QLineF] = []
         for triangle in mesh.triangles:
             a = QPointF(triangle.a.x, triangle.a.y)
             b = QPointF(triangle.b.x, triangle.b.y)
             c = QPointF(triangle.c.x, triangle.c.y)
-            painter.drawLine(QLineF(a, b))
-            painter.drawLine(QLineF(b, c))
-            painter.drawLine(QLineF(c, a))
-        if mesh.cut_edges:
+            triangle_lines.append(QLineF(a, b))
+            triangle_lines.append(QLineF(b, c))
+            triangle_lines.append(QLineF(c, a))
+        cut_lines = [QLineF(start.x, start.y, end.x, end.y) for start, end in mesh.cut_edges]
+        interface_lines = [QLineF(start.x, start.y, end.x, end.y) for start, end in mesh.interface_edges]
+        lines = (triangle_lines, cut_lines, interface_lines)
+        self._mesh_lines = (mesh, lines)
+        return lines
+
+    def _draw_mesh_overlay(self, painter: QPainter, mesh: Mesh) -> None:
+        triangle_lines, cut_lines, interface_lines = self._mesh_overlay_lines(mesh)
+        pen = QPen(Qt.GlobalColor.red, 1, Qt.PenStyle.SolidLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawLines(triangle_lines)
+        if cut_lines:
             painter.setPen(QPen(QColor("#111827"), 2.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            for start, end in mesh.cut_edges:
-                painter.drawLine(QLineF(start.x, start.y, end.x, end.y))
-        if mesh.interface_edges:
+            painter.drawLines(cut_lines)
+        if interface_lines:
             # Merge-inclusion boundary: the chain of mesh edges shared by both subdomains.
             painter.setPen(QPen(QColor("#15803d"), 2.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            for start, end in mesh.interface_edges:
-                painter.drawLine(QLineF(start.x, start.y, end.x, end.y))
+            painter.drawLines(interface_lines)
 
     def _draw_invalid_segments(self, painter: QPainter) -> None:
         pen = QPen(Qt.GlobalColor.yellow, 3, Qt.PenStyle.DashLine)

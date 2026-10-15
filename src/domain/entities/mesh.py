@@ -47,6 +47,8 @@ class Mesh:
     # Boundary of merge inclusions as meshed (each segment is an edge shared by both subdomains).
     interface_edges: tuple[tuple[Point, Point], ...] = ()
     timings: TriangulationTimings | None = None
+    # User-facing notes about geometry that could not be taken into account (e.g. a dropped cut).
+    warnings: tuple[str, ...] = ()
     _linear_triangles_cache: dict[tuple[int, float], tuple[LinearTriangle, ...]] = field(
         default_factory=dict,
         init=False,

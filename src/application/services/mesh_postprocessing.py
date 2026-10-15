@@ -10,12 +10,16 @@ except ImportError:  # pragma: no cover - exercised via explicit error path
 
 from src.domain.entities.linear_triangle import LinearTriangle
 from src.domain.entities.point import Point
-from src.domain.geometry.geometry_utils import orientation, triangle_quality
+from math import sqrt
+
+from src.domain.geometry.geometry_utils import _EPSILON as _GEOMETRY_EPSILON, orientation, triangle_quality
 
 Node = tuple[float, float]
 TriangleIndices = tuple[int, int, int]
 
 _TRIANGLE_KEY_NODE_BITS = 32
+# Factor of triangle_quality (4*sqrt(3)*area / sum of squared sides), evaluated as there.
+_FOUR_SQRT3 = 4.0 * sqrt(3.0)
 
 
 def compute_max_difference(triangles: list[LinearTriangle]) -> int:
@@ -476,6 +480,10 @@ def laplacian_smooth(
             current = positions[node_id]
             accepted = False
             trial_alpha = alpha
+            # Same as _move_improves_local_quality; the "before" star does not change between attempts.
+            before = _local_quality_tuple(
+                node_id, proposed_positions[node_id], proposed_positions, normalized_triangles, incident_triangles, tolerance
+            )
 
             for _attempt in range(4):
                 candidate = Point(
@@ -483,14 +491,10 @@ def laplacian_smooth(
                     current.y + (avg_y - current.y) * trial_alpha,
                 )
 
-                if _move_improves_local_quality(
-                    node_id=node_id,
-                    candidate=candidate,
-                    positions=proposed_positions,
-                    triangles=normalized_triangles,
-                    incident_triangles=incident_triangles,
-                    tolerance=tolerance,
-                ):
+                after = _local_quality_tuple(
+                    node_id, candidate, proposed_positions, normalized_triangles, incident_triangles, tolerance
+                )
+                if _quality_tuple_is_better(after, before, tolerance):
                     proposed_positions[node_id] = candidate
                     dx = candidate.x - current.x
                     dy = candidate.y - current.y
@@ -1101,7 +1105,7 @@ def _evaluate_rcm_candidates(
 ) -> list[tuple[list[tuple[float, float]], list[tuple[int, int, int]], int, int]]:
     results: list[tuple[list[tuple[float, float]], list[tuple[int, int, int]], int, int]] = []
     for start_node in start_nodes:
-        renumbered_nodes, renumbered_triangles, _ = _renumber_nodes_rcm_from_start(
+        renumbered_nodes, renumbered_triangles, beta = _renumber_nodes_rcm_from_start(
             nodes=nodes,
             normalized_triangles=normalized_triangles,
             index_base=index_base,
@@ -1109,9 +1113,9 @@ def _evaluate_rcm_candidates(
             degrees=degrees,
             start_node=start_node,
         )
-        beta = compute_max_difference(
+        if not results:
+            # Candidates differ only in numbering: the geometry check (degenerate triangles) runs once.
             _build_linear_triangles_from_indexed_mesh(renumbered_nodes, renumbered_triangles, index_base=index_base)
-        )
         results.append((renumbered_nodes, renumbered_triangles, beta, start_node))
     return results
 
@@ -1529,19 +1533,6 @@ def _swap_triangle_labels(
     return [tuple(remap.get(node_id, node_id) for node_id in triangle) for triangle in triangles]
 
 
-def _move_improves_local_quality(
-    node_id: int,
-    candidate: Point,
-    positions: list[Point],
-    triangles: list[TriangleIndices],
-    incident_triangles: list[list[int]],
-    tolerance: float,
-) -> bool:
-    before = _local_quality_tuple(node_id, positions[node_id], positions, triangles, incident_triangles, tolerance)
-    after = _local_quality_tuple(node_id, candidate, positions, triangles, incident_triangles, tolerance)
-    return _quality_tuple_is_better(after, before, tolerance)
-
-
 def _local_quality_tuple(
     node_id: int,
     candidate: Point,
@@ -1550,18 +1541,25 @@ def _local_quality_tuple(
     incident_triangles: list[list[int]],
     tolerance: float,
 ) -> tuple[float, float]:
+    # orientation() and triangle_quality() inlined (same float operations in the same order).
     qualities: list[float] = []
     for triangle_index in incident_triangles[node_id]:
         a_id, b_id, c_id = triangles[triangle_index]
         a = candidate if a_id == node_id else positions[a_id]
         b = candidate if b_id == node_id else positions[b_id]
         c = candidate if c_id == node_id else positions[c_id]
-        if orientation(a, b, c) <= 0:
+        ax, ay, bx, by, cx, cy = a.x, a.y, b.x, b.y, c.x, c.y
+        cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        if abs(cross) <= _GEOMETRY_EPSILON or cross < 0:
             return (-1.0, -1.0)
-        try:
-            qualities.append(triangle_quality(a, b, c))
-        except ValueError:
+        ab = sqrt((bx - ax) ** 2 + (by - ay) ** 2)
+        bc = sqrt((cx - bx) ** 2 + (cy - by) ** 2)
+        ca = sqrt((ax - cx) ** 2 + (ay - cy) ** 2)
+        area = abs((ax * (by - cy) + bx * (cy - ay) + cx * (ay - by)) / 2.0)
+        if area <= _GEOMETRY_EPSILON:
             return (-1.0, -1.0)
+        quality = _FOUR_SQRT3 * area / (ab**2 + bc**2 + ca**2)
+        qualities.append(max(0.0, min(1.0, quality)))
     if not qualities:
         return (-1.0, -1.0)
     return (min(qualities), sum(qualities) / len(qualities))

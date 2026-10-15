@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import subprocess
@@ -57,11 +58,11 @@ class InstrumentedMesher(afm_module.AdvancingFrontMesher):
         self._pending_raw = None
         self.events: Counter = Counter()
 
-    def generate_with_holes_and_cuts(self, boundary, holes, cuts):
+    def generate_with_holes_and_cuts(self, boundary, holes, cuts, *args, **kwargs):
         self.input_boundary = list(boundary)
         self.input_holes = [list(h) for h in holes]
         self.input_cuts = [list(c) for c in cuts]
-        return super().generate_with_holes_and_cuts(boundary, holes, cuts)
+        return super().generate_with_holes_and_cuts(boundary, holes, cuts, *args, **kwargs)
 
     def _generate_single_pass(self, polygon, holes, cut_segments, target_h):
         try:
@@ -73,8 +74,8 @@ class InstrumentedMesher(afm_module.AdvancingFrontMesher):
         self._pending_raw = result
         return result
 
-    def smooth(self, mesh, boundary, interface_points=None, iterations=5):
-        out = super().smooth(mesh, boundary, interface_points, iterations)
+    def smooth(self, mesh, boundary, interface_points=None, iterations=5, **kwargs):
+        out = super().smooth(mesh, boundary, interface_points, iterations, **kwargs)
         self.smoothed_to_raw.append((out, self._pending_raw))
         return out
 
@@ -431,9 +432,16 @@ def check_mesh(tris, shell, holes, cuts, origin, top, report: Report, prefix: st
 
 # ---------------------------------------------------------------- runner
 def run_case(path: Path, mode: TriangulationMode, top: int) -> Report:
-    importer = CoordinateJsonImporter()
-    imported = importer.load(str(path))
-    contours = importer.to_canvas_contours(imported)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if "contours" in raw:
+        # Намальована геометрія у форматі canvas.geometry_contours() (див. cases/ui_bugs).
+        contours = raw["contours"]
+        has_cuts = any(not (len(c) >= 3 and c[0] == c[-1]) for c in contours)
+    else:
+        importer = CoordinateJsonImporter()
+        imported = importer.load(str(path))
+        contours = importer.to_canvas_contours(imported)
+        has_cuts = bool(imported.cuts)
 
     holder: dict[str, InstrumentedMesher] = {}
 
@@ -457,7 +465,7 @@ def run_case(path: Path, mode: TriangulationMode, top: int) -> Report:
     report.add(f"  події мешера (сумарно по всіх проходах): {dict(m.events)}")
     report.add(
         f"  на вході мешера: межа {len(m.input_boundary)} точок, дірок {len(m.input_holes)}, розрізів {len(m.input_cuts)}"
-        + (" (розрізи ВІДКИНУТО адаптером!)" if imported.cuts and not m.input_cuts else "")
+        + (" (розрізи ВІДКИНУТО адаптером!)" if has_cuts and not m.input_cuts else "")
     )
 
     shell = [(p.x, p.y) for p in m.input_boundary]
