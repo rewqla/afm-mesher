@@ -1,0 +1,386 @@
+{
+ "fig22_like/fast": {
+  "signature": {
+   "nodes": 187,
+   "triangles": 271,
+   "bandwidth": 17,
+   "hash": "d5f193f5bf1fac0d443bf5a7104880bcab4d26d284b6b72830e12aeaf22c5153"
+  },
+  "timings": {
+   "wall": 0.1043416999996225,
+   "total": 0.10409260000005816,
+   "contours": 0.0035733999998228683,
+   "afm": 0.05482510000001639,
+   "post": 0.035726399999930436,
+   "numbering": 0.008929099999932077
+  }
+ },
+ "fig22_like/balanced": {
+  "signature": {
+   "nodes": 365,
+   "triangles": 591,
+   "bandwidth": 22,
+   "hash": "0cd5b0bd641ca26b19c500ce8af19bbcb3b88d349583501f8aaeb385f90b05ac"
+  },
+  "timings": {
+   "wall": 0.22764450000022407,
+   "total": 0.2273576999996294,
+   "contours": 0.003287300000010873,
+   "afm": 0.11859690000028422,
+   "post": 0.08297249999986889,
+   "numbering": 0.02098100000011982
+  }
+ },
+ "fig22_like/accurate": {
+  "signature": {
+   "nodes": 718,
+   "triangles": 1248,
+   "bandwidth": 29,
+   "hash": "851e508a265c8020ba60c6afcd8f7acca3c106e501753596269376c053349d66"
+  },
+  "timings": {
+   "wall": 0.4979928999996446,
+   "total": 0.49763819999998304,
+   "contours": 0.0034396000000924687,
+   "afm": 0.2653413000002729,
+   "post": 0.1842314999998962,
+   "numbering": 0.042121599999973114
+  }
+ },
+ "fig22_like_merge/fast": {
+  "signature": {
+   "nodes": 187,
+   "triangles": 271,
+   "bandwidth": 17,
+   "hash": "d5f193f5bf1fac0d443bf5a7104880bcab4d26d284b6b72830e12aeaf22c5153"
+  },
+  "timings": {
+   "wall": 0.10623549999991155,
+   "total": 0.10580930000014632,
+   "contours": 0.0034698999997999636,
+   "afm": 0.05605310000009922,
+   "post": 0.03606579999996029,
+   "numbering": 0.009164399999917805
+  }
+ },
+ "fig22_like_merge/balanced": {
+  "signature": {
+   "nodes": 365,
+   "triangles": 591,
+   "bandwidth": 22,
+   "hash": "0cd5b0bd641ca26b19c500ce8af19bbcb3b88d349583501f8aaeb385f90b05ac"
+  },
+  "timings": {
+   "wall": 0.4387886999998045,
+   "total": 0.4382897000000412,
+   "contours": 0.00897579999991649,
+   "afm": 0.22335070000008272,
+   "post": 0.1672761000004357,
+   "numbering": 0.03522069999962696
+  }
+ },
+ "fig22_like_merge/accurate": {
+  "signature": {
+   "nodes": 718,
+   "triangles": 1248,
+   "bandwidth": 29,
+   "hash": "851e508a265c8020ba60c6afcd8f7acca3c106e501753596269376c053349d66"
+  },
+  "timings": {
+   "wall": 0.9635302000001502,
+   "total": 0.9624949999997625,
+   "contours": 0.008521199999904638,
+   "afm": 0.520939399999861,
+   "post": 0.347101400000156,
+   "numbering": 0.0804718999997931
+  }
+ },
+ "square_cut_offgrid/fast": {
+  "signature": {
+   "nodes": 297,
+   "triangles": 514,
+   "bandwidth": 21,
+   "hash": "13188f2e2525440e87eab9e1be1a26f19cef75b04f744685e86d8bfd49923ec8"
+  },
+  "timings": {
+   "wall": 0.3443449999999757,
+   "total": 0.3429951000002802,
+   "contours": 0.006241399999908026,
+   "afm": 0.1571521999999277,
+   "post": 0.1479541000003337,
+   "numbering": 0.02823179999995773
+  }
+ },
+ "square_cut_offgrid/balanced": {
+  "signature": {
+   "nodes": 538,
+   "triangles": 967,
+   "bandwidth": 28,
+   "hash": "abcb797aae660812249797816ff5c482d5092095ed860328a5513997d07526b1"
+  },
+  "timings": {
+   "wall": 0.711986600000273,
+   "total": 0.7115211000000272,
+   "contours": 0.0036833999997725186,
+   "afm": 0.3178014999998595,
+   "post": 0.33950280000044586,
+   "numbering": 0.046692999999777385
+  }
+ },
+ "square_cut_offgrid/accurate": {
+  "signature": {
+   "nodes": 1076,
+   "triangles": 1998,
+   "bandwidth": 39,
+   "hash": "fefe744f96c7c9341fdc5bea17e176dc17356380d2b6fa277f7da688490a53ad"
+  },
+  "timings": {
+   "wall": 1.6375597999999627,
+   "total": 1.6367856000001666,
+   "contours": 0.006346500000290689,
+   "afm": 0.7483362999996643,
+   "post": 0.7725773999995909,
+   "numbering": 0.10219450000022334
+  }
+ },
+ "square_inclusion/fast": {
+  "signature": {
+   "nodes": 256,
+   "triangles": 428,
+   "bandwidth": 20,
+   "hash": "796b10638ea7d704a293a1ccb1353054035ae9452f8519410f3baec5da43332a"
+  },
+  "timings": {
+   "wall": 0.2710773000003428,
+   "total": 0.270578800000294,
+   "contours": 0.007299200000034034,
+   "afm": 0.13102520000029472,
+   "post": 0.1075658999998268,
+   "numbering": 0.02246160000004238
+  }
+ },
+ "square_inclusion/balanced": {
+  "signature": {
+   "nodes": 454,
+   "triangles": 796,
+   "bandwidth": 27,
+   "hash": "4f253de60d9a59441349640a813cd028efe575edac8cf147bc16106330c0c963"
+  },
+  "timings": {
+   "wall": 0.5362899000001562,
+   "total": 0.5356723999998394,
+   "contours": 0.006658700000116369,
+   "afm": 0.24446420000003855,
+   "post": 0.2418757999994341,
+   "numbering": 0.03899570000021413
+  }
+ },
+ "square_inclusion/accurate": {
+  "signature": {
+   "nodes": 936,
+   "triangles": 1708,
+   "bandwidth": 36,
+   "hash": "d3838ab9fdfd9aad8569764f230ad8f559e4cf33a5a68fdd983a934023e26a73"
+  },
+  "timings": {
+   "wall": 1.3232717000000775,
+   "total": 1.322639700000309,
+   "contours": 0.008090900000297552,
+   "afm": 0.5779573000004348,
+   "post": 0.6386561000003894,
+   "numbering": 0.09177039999985936
+  }
+ },
+ "complex_region_with_merge/fast": {
+  "signature": {
+   "nodes": 226,
+   "triangles": 326,
+   "bandwidth": 11,
+   "hash": "f15efcbcfa7a366bb66536378da4cb14e991c05b9076420af86a2cebfd97ccc1"
+  },
+  "timings": {
+   "wall": 0.23474829999986468,
+   "total": 0.2339179000000513,
+   "contours": 0.008182399999896006,
+   "afm": 0.1219599000000926,
+   "post": 0.084346999999525,
+   "numbering": 0.017034800000146788
+  }
+ },
+ "complex_region_with_merge/balanced": {
+  "signature": {
+   "nodes": 318,
+   "triangles": 456,
+   "bandwidth": 16,
+   "hash": "95f785a3532c85ac4e75bcbab316ece3ad27293307e9f1d0d6c79cf8dc80ec0a"
+  },
+  "timings": {
+   "wall": 0.4059549000003244,
+   "total": 0.4053589000000102,
+   "contours": 0.008471999999983382,
+   "afm": 0.23793379999960962,
+   "post": 0.12380820000043968,
+   "numbering": 0.03255039999976361
+  }
+ },
+ "complex_region_with_merge/accurate": {
+  "signature": {
+   "nodes": 757,
+   "triangles": 1272,
+   "bandwidth": 20,
+   "hash": "7a7d972c70d31fc28972882976f6e80976cfd076050aa83240b59c0d2bc6c623"
+  },
+  "timings": {
+   "wall": 0.9707929000001059,
+   "total": 0.9697447999997166,
+   "contours": 0.007338699999763776,
+   "afm": 0.5065192000001844,
+   "post": 0.37114310000015394,
+   "numbering": 0.0778429000001779
+  }
+ },
+ "complex_nested_inclusions/fast": {
+  "signature": {
+   "nodes": 95,
+   "triangles": 126,
+   "bandwidth": 12,
+   "hash": "55e70722c13e68ef187828e8773c84778ff64b6ac0639492742cdd5c01e22449"
+  },
+  "timings": {
+   "wall": 0.10646960000030958,
+   "total": 0.10599249999995664,
+   "contours": 0.007405100000141829,
+   "afm": 0.05320179999989705,
+   "post": 0.03436059999967256,
+   "numbering": 0.009307799999987765
+  }
+ },
+ "complex_nested_inclusions/balanced": {
+  "signature": {
+   "nodes": 150,
+   "triangles": 210,
+   "bandwidth": 15,
+   "hash": "9a23d5d696dfd6fa215723affccf376bcbc953ea458839c52baeebdaeaf3f617"
+  },
+  "timings": {
+   "wall": 0.16205650000028982,
+   "total": 0.16153990000020713,
+   "contours": 0.009235900000021502,
+   "afm": 0.07911539999986417,
+   "post": 0.05786110000008193,
+   "numbering": 0.013750099999924714
+  }
+ },
+ "complex_nested_inclusions/accurate": {
+  "signature": {
+   "nodes": 287,
+   "triangles": 454,
+   "bandwidth": 21,
+   "hash": "e16eca162432395a1c74a1b9b755dc72fc2ad24202ac6777d5c3e6ae46a80b40"
+  },
+  "timings": {
+   "wall": 0.35757710000007137,
+   "total": 0.35665759999983493,
+   "contours": 0.008172800000011193,
+   "afm": 0.17329239999980928,
+   "post": 0.1485912999996799,
+   "numbering": 0.02525740000010046
+  }
+ },
+ "fig22_handdrawn/fast": {
+  "signature": {
+   "nodes": 204,
+   "triangles": 303,
+   "bandwidth": 17,
+   "hash": "149959395ca529dcc64efca5b704524d2723d6feba9485b8f7d327dab95ad0b2"
+  },
+  "timings": {
+   "wall": 0.23087010000017472,
+   "total": 0.22969100000000253,
+   "contours": 0.004809500000192202,
+   "afm": 0.12432110000008834,
+   "post": 0.08030090000011114,
+   "numbering": 0.018057199999930162
+  }
+ },
+ "fig22_handdrawn/balanced": {
+  "signature": {
+   "nodes": 380,
+   "triangles": 630,
+   "bandwidth": 21,
+   "hash": "29502369582e3410655d1cd6572eecf173666ce4d8ea2ebf00f101c3c0dd27e1"
+  },
+  "timings": {
+   "wall": 0.46801319999985935,
+   "total": 0.4658948999999666,
+   "contours": 0.013116399999944406,
+   "afm": 0.24515900000005786,
+   "post": 0.1668774999998277,
+   "numbering": 0.03679340000007869
+  }
+ },
+ "fig22_handdrawn/accurate": {
+  "signature": {
+   "nodes": 793,
+   "triangles": 1366,
+   "bandwidth": 31,
+   "hash": "158684b534e617d928c42addf82a5cfe13961d83e0f852388a310d56281124bb"
+  },
+  "timings": {
+   "wall": 1.1011167000001478,
+   "total": 1.09919919999993,
+   "contours": 0.04426969999985886,
+   "afm": 0.5774335999999494,
+   "post": 0.38036779999993087,
+   "numbering": 0.086829299999863
+  }
+ },
+ "img_spot_with_circle/fast": {
+  "signature": {
+   "nodes": 375,
+   "triangles": 606,
+   "bandwidth": 16,
+   "hash": "e55657a2811007f16ca30c6eaeeb26dac646a001cfd927c65959bc74c5507c32"
+  },
+  "timings": {
+   "wall": 0.7695779000000584,
+   "total": 0.7621944999996231,
+   "contours": 0.4071294999998827,
+   "afm": 0.19102040000007037,
+   "post": 0.13491370000019742,
+   "numbering": 0.026441399999839632
+  }
+ },
+ "img_spot_with_circle/balanced": {
+  "signature": {
+   "nodes": 715,
+   "triangles": 1228,
+   "bandwidth": 22,
+   "hash": "2dacbfc3b40ab8c0bff052e655e9f0bc170bae0b458b9edcda5265cd5c1541b2"
+  },
+  "timings": {
+   "wall": 1.2673273000000336,
+   "total": 1.2593015999996169,
+   "contours": 0.38387299999976676,
+   "afm": 0.47874000000001615,
+   "post": 0.3239542999999685,
+   "numbering": 0.06754839999985052
+  }
+ },
+ "img_spot_with_circle/accurate": {
+  "signature": {
+   "nodes": 1376,
+   "triangles": 2475,
+   "bandwidth": 32,
+   "hash": "0ab6f40345b7466155d43665b83b60a8947cffecb29740ec722470ebf966ee6a"
+  },
+  "timings": {
+   "wall": 2.4368659999995543,
+   "total": 2.427296899999874,
+   "contours": 0.4638775999997051,
+   "afm": 1.1050694999998996,
+   "post": 0.7017678000001979,
+   "numbering": 0.14830659999961426
+  }
+ }
+}

@@ -75,7 +75,8 @@ def point_in_polygon(point: Point, polygon: list[Point], include_boundary: bool 
         a = polygon[i]
         b = polygon[(i + 1) % n]
 
-        if orientation(a, point, b) == 0 and _on_segment(a, point, b):
+        # Cheap box test first; both predicates are pure, so the order does not change the result.
+        if _on_segment(a, point, b) and orientation(a, point, b) == 0:
             return include_boundary
 
         intersects = ((a.y > point.y) != (b.y > point.y))
@@ -85,6 +86,42 @@ def point_in_polygon(point: Point, polygon: list[Point], include_boundary: bool 
                 inside = not inside
 
     return inside
+
+
+class PolygonRowIndex:
+    """point_in_polygon over a fixed ring with its edges bucketed by y.
+
+    Only edges whose y-range (widened by _EPSILON) covers the point can be "on segment" or toggle the
+    crossing parity, so checking just the point's row gives the same answer as the full scan."""
+
+    def __init__(self, polygon: list[Point]) -> None:
+        if len(polygon) < 3:
+            raise ValueError("Polygon must contain at least 3 vertices.")
+        n = len(polygon)
+        ys = [p.y for p in polygon]
+        span = max(ys) - min(ys)
+        self._row_height = span / max(1.0, n / 4.0) if span > 0 else 1.0
+        self._rows: dict[int, list[tuple[Point, Point]]] = {}
+        h = self._row_height
+        for i in range(n):
+            a = polygon[i]
+            b = polygon[(i + 1) % n]
+            low = min(a.y, b.y) - _EPSILON
+            high = max(a.y, b.y) + _EPSILON
+            for row in range(int(low // h), int(high // h) + 1):
+                self._rows.setdefault(row, []).append((a, b))
+
+    def contains(self, point: Point, include_boundary: bool = True) -> bool:
+        inside = False
+        for a, b in self._rows.get(int(point.y // self._row_height), ()):
+            if _on_segment(a, point, b) and orientation(a, point, b) == 0:
+                return include_boundary
+            intersects = ((a.y > point.y) != (b.y > point.y))
+            if intersects:
+                x_intersection = (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x
+                if x_intersection > point.x:
+                    inside = not inside
+        return inside
 
 
 def triangle_quality(a: Point, b: Point, c: Point) -> float:

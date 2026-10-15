@@ -1,0 +1,24 @@
+circle.png             UI[closed=1 open=0] OK tris=398 loops=1 cut_edges=0 warnings=0
+                       run(QImage) OK tris=233 loops=2 cut_edges=0 warnings=0
+hourglass.png          UI[closed=2 open=1] OK tris=323 loops=2 cut_edges=0 warnings=1
+                       run(QImage) OK tris=414 loops=2 cut_edges=0 warnings=0
+l_shape.png            UI[closed=1 open=0] OK tris=398 loops=1 cut_edges=0 warnings=0
+                       run(QImage) OK tris=287 loops=2 cut_edges=0 warnings=0
+one.png                UI[closed=1 open=0] OK tris=1032 loops=1 cut_edges=0 warnings=0
+                       run(QImage) OK tris=785 loops=2 cut_edges=0 warnings=0
+spot_with_circle.png   UI[closed=505 open=2] OK tris=1230 loops=2 cut_edges=0 warnings=2
+                       run(QImage) OK tris=1228 loops=2 cut_edges=0 warnings=0
+spot_with_lines.png    UI[closed=505 open=4] OK tris=1230 loops=2 cut_edges=0 warnings=4
+                       run(QImage) OK tris=1228 loops=2 cut_edges=0 warnings=0
+square.png             UI[closed=1 open=0] OK tris=398 loops=1 cut_edges=0 warnings=0
+                       run(QImage) OK tris=209 loops=2 cut_edges=0 warnings=0
+star.png               UI[closed=1 open=0] OK tris=688 loops=1 cut_edges=0 warnings=0
+                       run(QImage) OK tris=588 loops=2 cut_edges=0 warnings=0
+u_shape.png            UI[closed=2 open=1] OK tris=412 loops=2 cut_edges=0 warnings=1
+                       run(QImage) OK tris=448 loops=2 cut_edges=0 warnings=0
+1.png                  UI[closed=1 open=3] OK tris=942 loops=1 cut_edges=24 warnings=1
+                       run(QImage) OK tris=776 loops=3 cut_edges=0 warnings=0
+3.png                  UI[closed=2 open=0] OK tris=1736 loops=1 cut_edges=0 warnings=0
+                       run(QImage) OK tris=773 loops=2 cut_edges=0 warnings=0
+4.png                  UI[closed=2 open=0] FAIL AFM stalled: active front cannot be advanced further.
+                       run(QImage) OK tris=982 loops=2 cut_edges=0 warnings=0

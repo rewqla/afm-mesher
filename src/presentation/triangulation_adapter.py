@@ -6,7 +6,9 @@ from math import ceil, hypot, isclose
 from time import monotonic, perf_counter
 from typing import ClassVar
 
-from PySide6.QtGui import QColor, QImage
+import numpy as np
+
+from PySide6.QtGui import QImage
 
 from src.application.services.advancing_front_mesher import (
     DEFAULT_TIME_BUDGET_S,
@@ -21,12 +23,11 @@ from src.application.services.region_topology import ClassifiedRegion, RegionPol
 from src.domain.entities.point import Point
 from src.domain.entities.mesh import Mesh, MeshSourceContours, TriangulationTimings
 from src.domain.geometry.geometry_utils import mesh_average_quality, point_in_polygon, segments_intersect
+from src.domain.geometry.resample import resample_polyline
 from src.infrastructure.image.photo_preprocessor import simplify_contour
 from src.infrastructure.processing.image_boundary_extractor import extract_contours
-from src.infrastructure.processing.stroke_centerline_extractor import (
-    detect_stroke_branch_points,
-    extract_stroke_centerlines,
-)
+from src.infrastructure.processing.stroke_fill_classifier import extract_fill_and_stroke_contours
+from src.infrastructure.processing.stroke_centerline_extractor import detect_stroke_branch_points
 from src.presentation.tri_debug import tri_debug
 from src.presentation.tools import TriangulationMode
 
@@ -37,6 +38,20 @@ Contour = list[tuple[int, int]]
 INCLUSION_IGNORE = "ignore"
 INCLUSION_MERGE = "merge"
 INCLUSION_TYPES = (INCLUSION_IGNORE, INCLUSION_MERGE)
+
+
+_CUT_REJECTION_REASONS_UK = {
+    "Cut intersects or touches hole boundary.": "перетинає межу дірки або йде вздовж неї.",
+    "Cut segment lies outside boundary.": "виходить за зовнішній контур.",
+    "Cut intersects hole interior.": "проходить через дірку.",
+    "Cut self-intersection is not allowed.": "має самоперетин.",
+    "Cut contains too short segment.": "занадто короткий.",
+}
+
+
+def _describe_cut(cut: list[Point]) -> str:
+    start, end = cut[0], cut[-1]
+    return f"({start.x:.0f}, {start.y:.0f})–({end.x:.0f}, {end.y:.0f})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,8 +194,6 @@ class TriangulationAdapter:
         cuts = self._extract_cuts(open_contours, epsilon)
         cuts = [self._optimize_polyline_for_meshing(cut, settings.target_edge_length, max_points=500) for cut in cuts]
         cuts = [cut for cut in cuts if len(cut) >= 2]
-        cuts = self._filter_cuts_conflicting_with_holes(cuts, holes)
-        cuts = self._merge_collinear_overlapping_cuts(cuts)
         runtime_settings = self._adaptive_runtime_settings(settings, boundary)
         self._mesher = AdvancingFrontMesher(
             min_triangle_quality=runtime_settings.min_triangle_quality,
@@ -190,8 +203,33 @@ class TriangulationAdapter:
             numbering_strategy=self.numbering_strategy,
             time_budget_s=self.time_budget_s,
         )
+        if source_contours is None:
+            # Imported coordinates are the user's exact vertices; only drawn geometry is resampled.
+            boundary, holes, merge_rings, cuts = self._resample_drawn_geometry(
+                boundary, holes, merge_rings, cuts, settings.contour_epsilon
+            )
+        # Geometry that cannot be meshed is never dropped silently: every drop is reported to the user.
+        warnings: list[str] = []
+        kept_cuts: list[list[Point]] = []
+        for cut in cuts:
+            pieces = self._split_cut_by_hole_conflicts(cut, holes) if holes else [cut]
+            if not pieces:
+                warnings.append(f"Розріз {_describe_cut(cut)} лежить усередині дірки — його не враховано.")
+            kept_cuts.extend(pieces)
+        cuts = self._merge_collinear_overlapping_cuts(kept_cuts)
         deadline = monotonic() + self.time_budget_s
         hole_points = [hole.points for hole in holes]
+        # One invalid cut must not take the independent ones down with it: check each on its own.
+        valid_cuts: list[list[Point]] = []
+        for cut in cuts:
+            reason = self._mesher.cut_rejection_reason(boundary, hole_points, cut)
+            if reason is None:
+                valid_cuts.append(cut)
+            else:
+                warnings.append(
+                    f"Розріз {_describe_cut(cut)} не враховано: {_CUT_REJECTION_REASONS_UK.get(reason, reason)}"
+                )
+        cuts = valid_cuts
         tri_debug(
             "tri_adapter.run_with_contours.geometry",
             boundary_points=len(boundary),
@@ -199,7 +237,8 @@ class TriangulationAdapter:
             merge_inclusions=len(merge_rings),
             cuts=len(cuts),
         )
-        attempted_cuts = [cuts, self._prune_overlapping_collinear_cuts(cuts)]
+        pruned_cuts = self._prune_overlapping_collinear_cuts(cuts)
+        attempted_cuts = [cuts, pruned_cuts]
         if cuts:
             # Last-resort fallback: ignore problematic cuts and keep shell+holes triangulation.
             attempted_cuts.append([])
@@ -217,6 +256,17 @@ class TriangulationAdapter:
                     candidate_cuts=len(candidate_cuts),
                     triangles=len(mesh.triangles),
                 )
+                if cuts and not candidate_cuts:
+                    reason = f" ({last_error})" if last_error is not None else ""
+                    warnings.append(
+                        f"Сітку з розрізами побудувати не вдалося{reason}; сітку побудовано без розрізів "
+                        f"(не враховано розрізів: {len(cuts)})."
+                    )
+                elif candidate_cuts is pruned_cuts and len(pruned_cuts) < len(cuts):
+                    warnings.append(
+                        f"Розрізи, що частково накладаються один на одного, спрощено: "
+                        f"не враховано відрізків: {len(cuts) - len(pruned_cuts)}."
+                    )
                 break
             except MeshingTimeoutError:
                 raise
@@ -243,6 +293,7 @@ class TriangulationAdapter:
             source_contours=source_contours,
             cut_edges=mesh.cut_edges,
             interface_edges=mesh.interface_edges,
+            warnings=tuple(warnings),
         )
         if not mesh.triangles:
             raise ValueError("Triangulation produced no valid triangles for the selected region.")
@@ -255,6 +306,153 @@ class TriangulationAdapter:
             numbering_s=stage_s["numbering"],
         )
         return mesh, coefficient
+
+    def _resample_drawn_geometry(
+        self,
+        boundary: list[Point],
+        holes: list[RegionPolygon],
+        merge_rings: list[list[Point]],
+        cuts: list[list[Point]],
+        epsilon: float,
+    ) -> tuple[list[Point], list[RegionPolygon], list[list[Point]], list[list[Point]]]:
+        """Resample drawn contours and cuts to about the mesher's step along the curve.
+
+        Drawn curves keep a vertex every 1-3 px; as boundary nodes they produce tiny needle triangles.
+        Corners, cut ends on a contour and points where contours / cuts touch are kept exactly. If the
+        resampled geometry is not equivalent (rings intersect, a valid cut becomes invalid), the
+        original geometry is used."""
+        step = self._mesher.resolve_target_step(boundary)
+        # Drawn contours already carry up to `epsilon` of simplification error plus pixel staircase.
+        deviation = max(1.0, epsilon) + 0.1 * step
+        snap = max(1.0, epsilon)
+        rings = [boundary, *(hole.points for hole in holes), *merge_rings]
+        # Cut ends near a contour / another cut are attached to it exactly; crossings of a cut with a
+        # contour or another cut become a vertex of both, so no sub-pixel pieces appear around them.
+        cut_ends = [(p, snap, True) for cut in cuts for p in (cut[0], cut[-1])]
+        cut_ring_crossings = [
+            [self._polyline_crossings(cut, False, ring, True) for ring in rings] for cut in cuts
+        ]
+        cut_cut_crossings = {
+            (i, j): self._polyline_crossings(cuts[i], False, cuts[j], False)
+            for i in range(len(cuts))
+            for j in range(len(cuts))
+            if i < j
+        }
+
+        def ring_anchors(index: int) -> list[tuple[Point, float, bool]]:
+            others = [(p, 0.5, False) for j, ring in enumerate(rings) if j != index for p in ring]
+            crossings = [(p, 0.5, True) for per_ring in cut_ring_crossings for p in per_ring[index]]
+            return [*cut_ends, *crossings, *others]
+
+        def cut_anchors(index: int) -> list[tuple[Point, float, bool]]:
+            anchors = [(p, 0.5, True) for per_ring in cut_ring_crossings[index] for p in per_ring]
+            for j, other in enumerate(cuts):
+                if j == index:
+                    continue
+                anchors.extend((p, snap, True) for p in (other[0], other[-1]))
+                anchors.extend((p, 0.5, True) for p in cut_cut_crossings[(min(index, j), max(index, j))])
+            return anchors
+
+        new_rings = [
+            resample_polyline(ring, step, closed=True, anchors=ring_anchors(i), max_deviation=deviation)
+            for i, ring in enumerate(rings)
+        ]
+        new_cuts = [
+            resample_polyline(cut, step, closed=False, anchors=cut_anchors(i), max_deviation=deviation)
+            for i, cut in enumerate(cuts)
+        ]
+
+        new_boundary = new_rings[0]
+        new_holes = [RegionPolygon(points=ring) for ring in new_rings[1 : 1 + len(holes)]]
+        new_merge = new_rings[1 + len(holes) :]
+        if not self._resampled_geometry_is_equivalent(rings, new_rings, cuts, new_cuts, len(holes)):
+            tri_debug("tri_adapter.resample.rejected")
+            return boundary, holes, merge_rings, cuts
+        tri_debug(
+            "tri_adapter.resample",
+            step=step,
+            ring_points_before=sum(map(len, rings)),
+            ring_points_after=sum(map(len, new_rings)),
+            cut_points_before=sum(map(len, cuts)),
+            cut_points_after=sum(map(len, new_cuts)),
+        )
+        return new_boundary, new_holes, new_merge, new_cuts
+
+    def _resampled_geometry_is_equivalent(
+        self,
+        rings: list[list[Point]],
+        new_rings: list[list[Point]],
+        cuts: list[list[Point]],
+        new_cuts: list[list[Point]],
+        hole_count: int,
+    ) -> bool:
+        # Rings must stay pairwise apart unless they touched before (touch points are kept as anchors).
+        for i in range(len(new_rings)):
+            for j in range(i + 1, len(new_rings)):
+                if self._rings_cross(new_rings[i], new_rings[j]) and not self._rings_cross(rings[i], rings[j]):
+                    return False
+        # Every cut keeps its verdict (validity against the shell and the holes).
+        old_holes = rings[1 : 1 + hole_count]
+        new_holes = new_rings[1 : 1 + hole_count]
+        for cut, new_cut in zip(cuts, new_cuts):
+            if self._cut_is_usable(rings[0], old_holes, cut) != self._cut_is_usable(new_rings[0], new_holes, new_cut):
+                return False
+        return True
+
+    def _polyline_crossings(
+        self,
+        first: list[Point],
+        first_closed: bool,
+        second: list[Point],
+        second_closed: bool,
+    ) -> list[Point]:
+        """Points where the two polylines cross or touch (one per crossing segment pair)."""
+        def edges(points: list[Point], closed: bool) -> list[tuple[Point, Point]]:
+            pairs = list(zip(points, points[1:]))
+            if closed and len(points) > 2 and points[0] != points[-1]:
+                pairs.append((points[-1], points[0]))
+            return pairs
+
+        second_edges = edges(second, second_closed)
+        found: list[Point] = []
+        for a, b in edges(first, first_closed):
+            for c, d in second_edges:
+                if max(c.x, d.x) < min(a.x, b.x) or min(c.x, d.x) > max(a.x, b.x):
+                    continue
+                if max(c.y, d.y) < min(a.y, b.y) or min(c.y, d.y) > max(a.y, b.y):
+                    continue
+                t = self._segment_intersection_t(a, b, c, d)
+                if t is not None:
+                    point = self._point_on_segment(a, b, t)
+                    if all(hypot(point.x - q.x, point.y - q.y) > 1e-6 for q in found):
+                        found.append(point)
+        return found
+
+    def _cut_is_usable(self, boundary: list[Point], hole_rings: list[list[Point]], cut: list[Point]) -> bool:
+        """At least one piece of the cut (outside the holes) passes the mesher's cut validation."""
+        holes = [RegionPolygon(points=ring) for ring in hole_rings]
+        pieces = self._split_cut_by_hole_conflicts(cut, holes) if holes else [cut]
+        return any(self._mesher.cut_rejection_reason(boundary, hole_rings, piece) is None for piece in pieces)
+
+    def _rings_cross(self, first: list[Point], second: list[Point]) -> bool:
+        """Proper crossing between the edges of two closed rings (shared vertices do not count)."""
+        def box(ring: list[Point]) -> tuple[float, float, float, float]:
+            return min(p.x for p in ring), max(p.x for p in ring), min(p.y for p in ring), max(p.y for p in ring)
+
+        ax0, ax1, ay0, ay1 = box(first)
+        bx0, bx1, by0, by1 = box(second)
+        if ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0:
+            return False
+        second_edges = list(zip(second, [*second[1:], second[0]]))
+        for a, b in zip(first, [*first[1:], first[0]]):
+            for c, d in second_edges:
+                if max(c.x, d.x) < min(a.x, b.x) or min(c.x, d.x) > max(a.x, b.x):
+                    continue
+                if max(c.y, d.y) < min(a.y, b.y) or min(c.y, d.y) > max(a.y, b.y):
+                    continue
+                if segments_intersect(a, b, c, d, include_endpoints=False):
+                    return True
+        return False
 
     def _merge_flags(
         self,
@@ -337,16 +535,10 @@ class TriangulationAdapter:
             midpoint = self._point_on_segment(a, b, tm)
             if any(point_in_polygon(midpoint, hole.points, include_boundary=True) for hole in holes):
                 continue
-            # Avoid exact touching of hole boundaries: trim interval ends that come from intersections.
-            seg_len = hypot(b.x - a.x, b.y - a.y)
-            offset_t = (0.5 / seg_len) if seg_len > 1e-9 else 0.0
-            dt = min(max(offset_t, 1e-4), (t1 - t0) * 0.25)
-            seg_t0 = t0 + dt if t0 > 0.0 else t0
-            seg_t1 = t1 - dt if t1 < 1.0 else t1
-            if seg_t1 - seg_t0 <= 1e-9:
-                continue
-            p0 = self._point_on_segment(a, b, seg_t0)
-            p1 = self._point_on_segment(a, b, seg_t1)
+            # Clip exactly at the hole boundary: the cut end then becomes a vertex of the hole ring
+            # (the mesher inserts it), so the cut is attached to the hole instead of stopping short.
+            p0 = self._point_on_segment(a, b, t0)
+            p1 = self._point_on_segment(a, b, t1)
             if hypot(p1.x - p0.x, p1.y - p0.y) > 1e-9:
                 kept.append((p0, p1))
         return kept
@@ -450,7 +642,9 @@ class TriangulationAdapter:
         t2, t3 = sorted((proj_t(c), proj_t(d)))
         overlap_start = max(t0, t2)
         overlap_end = min(t1, t3)
-        if overlap_end < overlap_start - 1e-9:
+        # Segments that only meet end to end (consecutive pieces of one polyline) do not overlap:
+        # merging them would replace the shared vertex by a projection next to it.
+        if (overlap_end - overlap_start) * line_len <= 1e-6:
             return None
 
         merged_start_t = min(t0, t2)
@@ -495,30 +689,35 @@ class TriangulationAdapter:
         grayscale = image.convertToFormat(QImage.Format.Format_Grayscale8)
         width = grayscale.width()
         height = grayscale.height()
-        mask: Mask = []
-
-        for y in range(height):
-            row: list[int] = []
-            for x in range(width):
-                value = QColor(grayscale.pixel(x, y)).value()
-                # Geometric contours are drawn in black; convert black regions to 1.
-                row.append(1 if value <= self.threshold else 0)
-            mask.append(row)
-        return mask
+        if width == 0 or height == 0:
+            return [[] for _ in range(height)]
+        # Grayscale8 rows are padded to bytesPerLine; a pixel's QColor value is its gray byte.
+        stride = grayscale.bytesPerLine()
+        gray = np.frombuffer(grayscale.constBits(), dtype=np.uint8, count=stride * height).reshape(height, stride)
+        # Geometric contours are drawn in black; convert black regions to 1.
+        return (gray[:, :width] <= self.threshold).astype(np.int64).tolist()
 
     def _extract_geometry_contours(self, image_data: QImage) -> list[Contour]:
+        # Filled shapes give closed boundary contours, pen strokes their centerlines (cuts, or a
+        # boundary when closed); without strokes this is exactly the boundary extraction.
         mask = self._qimage_to_mask(image_data)
-        contours = extract_contours(mask)
+        contours = extract_fill_and_stroke_contours(mask)
         if not contours:
             raise ValueError("No contour geometry found.")
         return contours
 
     def extract_contours_from_image(self, image_data: QImage) -> list[Contour]:
-        return self._extract_geometry_contours(image_data)
+        """Boundary contours of every black region (canvas resync after drawing, closed-fill cache)."""
+        contours = extract_contours(self._qimage_to_mask(image_data))
+        if not contours:
+            raise ValueError("No contour geometry found.")
+        return contours
 
     def extract_stroke_contours_from_image(self, image_data: QImage) -> list[Contour]:
+        # A loaded picture is mostly pen strokes, but a filled shape in it is an inclusion: only thin
+        # components are reduced to centerlines (without fills this is the plain stroke skeleton).
         mask = self._qimage_to_mask(image_data)
-        contours = extract_stroke_centerlines(mask)
+        contours = extract_fill_and_stroke_contours(mask)
         if not contours:
             raise ValueError("No stroke geometry found.")
         return contours
@@ -571,6 +770,17 @@ class TriangulationAdapter:
         ]
         areas = [self._polygon_area(points[:-1] if len(points) >= 2 and points[0] == points[-1] else points) for points in points_cache]
         keep = [True] * len(closed_contours)
+        probes = [self._representative_point(points) for points in points_cache]
+        # Widened bounding boxes: a probe outside one is not strictly inside that contour.
+        bounds = [
+            (
+                min(p.x for p in points) - 1e-6,
+                max(p.x for p in points) + 1e-6,
+                min(p.y for p in points) - 1e-6,
+                max(p.y for p in points) + 1e-6,
+            ) if points else (0.0, -1.0, 0.0, -1.0)
+            for points in points_cache
+        ]
 
         for outer_idx in range(len(closed_contours)):
             if not keep[outer_idx]:
@@ -581,10 +791,13 @@ class TriangulationAdapter:
                 continue
 
             child_candidates: list[int] = []
+            x0, x1, y0, y1 = bounds[outer_idx]
             for inner_idx in range(len(closed_contours)):
                 if inner_idx == outer_idx or not keep[inner_idx]:
                     continue
-                probe = self._representative_point(points_cache[inner_idx])
+                probe = probes[inner_idx]
+                if len(outer_points) >= 3 and not (x0 <= probe.x <= x1 and y0 <= probe.y <= y1):
+                    continue
                 if point_in_polygon(probe, outer_points, include_boundary=False):
                     child_candidates.append(inner_idx)
 
@@ -598,8 +811,8 @@ class TriangulationAdapter:
             if ratio < 0.75:
                 continue
 
-            outer_centroid = self._representative_point(outer_points)
-            inner_centroid = self._representative_point(points_cache[inner_idx])
+            outer_centroid = probes[outer_idx]
+            inner_centroid = probes[inner_idx]
             centroid_distance = hypot(outer_centroid.x - inner_centroid.x, outer_centroid.y - inner_centroid.y)
             if centroid_distance > 6.0:
                 continue

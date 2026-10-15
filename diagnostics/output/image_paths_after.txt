@@ -1,0 +1,22 @@
+circle.png             UI[closed=2 open=0] OK tris=233 loops=2 cut_edges=0 warnings=0
+                       run(QImage) OK tris=233 loops=2 cut_edges=0 warnings=0
+hourglass.png          UI[closed=2 open=0] OK tris=414 loops=2 cut_edges=0 warnings=0
+                       run(QImage) OK tris=414 loops=2 cut_edges=0 warnings=0
+l_shape.png            UI[closed=2 open=0] OK tris=287 loops=2 cut_edges=0 warnings=0
+                       run(QImage) OK tris=287 loops=2 cut_edges=0 warnings=0
+one.png                UI[closed=2 open=0] OK tris=785 loops=2 cut_edges=0 warnings=0
+                       run(QImage) OK tris=785 loops=2 cut_edges=0 warnings=0
+spot_with_circle.png   UI[closed=505 open=0] OK tris=1228 loops=2 cut_edges=0 warnings=0
+                       run(QImage) OK tris=1228 loops=2 cut_edges=0 warnings=0
+spot_with_lines.png    UI[closed=502 open=3] OK tris=1197 loops=2 cut_edges=0 warnings=3
+                       run(QImage) OK tris=1197 loops=2 cut_edges=0 warnings=3
+square.png             UI[closed=2 open=0] OK tris=209 loops=2 cut_edges=0 warnings=0
+                       run(QImage) OK tris=209 loops=2 cut_edges=0 warnings=0
+star.png               UI[closed=2 open=0] OK tris=588 loops=2 cut_edges=0 warnings=0
+                       run(QImage) OK tris=588 loops=2 cut_edges=0 warnings=0
+u_shape.png            UI[closed=2 open=0] OK tris=448 loops=2 cut_edges=0 warnings=0
+                       run(QImage) OK tris=448 loops=2 cut_edges=0 warnings=0
+1.png                  UI[closed=2 open=4] OK tris=736 loops=2 cut_edges=48 warnings=1
+                       run(QImage) OK tris=736 loops=2 cut_edges=48 warnings=1
+1_clean.png            UI[closed=2 open=3] OK tris=736 loops=2 cut_edges=48 warnings=0
+                       run(QImage) OK tris=736 loops=2 cut_edges=48 warnings=0

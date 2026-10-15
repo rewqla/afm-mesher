@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import heapq
+from bisect import bisect_left, insort
 from collections import defaultdict
 from datetime import datetime
 from math import ceil, floor, sqrt
@@ -21,6 +21,7 @@ from src.domain.entities.mesh import Mesh
 from src.domain.entities.point import Point
 from src.domain.entities.triangle import Triangle
 from src.domain.geometry.geometry_utils import (
+    PolygonRowIndex,
     distance,
     orientation,
     point_in_polygon,
@@ -47,6 +48,8 @@ _AREA_RELATIVE_TOLERANCE = 1e-6
 _CUT_TOUCH_TOLERANCE = 1e-6
 # Vertex-on-edge tolerance (pixels, scaled by edge length) for conformity checks.
 _ON_EDGE_RELATIVE_TOLERANCE = 1e-7
+# Widening (px) of bounding boxes used to skip far-away geometry in exact predicates.
+_BOX_MARGIN = 1e-6
 # Runaway-front guard. A healthy front may grow several times beyond its initial size on fine
 # meshes, but it cannot have more edges than a full mesh of the domain with step h (~3*area/h^2).
 _MAX_FRONT_GROWTH_FACTOR = 4.0
@@ -71,6 +74,8 @@ class _TriangleSpatialIndex:
         self._cell_size = max(cell_size, 1e-6)
         self._cells: dict[tuple[int, int], list[int]] = defaultdict(list)
         self.triangles: list[tuple[Point, Point, Point]] = []
+        # (min_x, max_x, min_y, max_y) per triangle.
+        self.boxes: list[tuple[float, float, float, float]] = []
 
     def _cell_range(self, points: tuple[Point, ...]) -> tuple[int, int, int, int]:
         c = self._cell_size
@@ -84,6 +89,7 @@ class _TriangleSpatialIndex:
     def insert(self, a: Point, b: Point, c: Point) -> int:
         idx = len(self.triangles)
         self.triangles.append((a, b, c))
+        self.boxes.append((min(a.x, b.x, c.x), max(a.x, b.x, c.x), min(a.y, b.y, c.y), max(a.y, b.y, c.y)))
         x0, x1, y0, y1 = self._cell_range((a, b, c))
         for gx in range(x0, x1 + 1):
             for gy in range(y0, y1 + 1):
@@ -97,6 +103,114 @@ class _TriangleSpatialIndex:
             for gy in range(y0, y1 + 1):
                 found.update(self._cells.get((gx, gy), ()))
         return found
+
+    def query_box_overlaps(self, a: Point, b: Point, c: Point) -> list[int]:
+        """query() narrowed to triangles whose boxes are not strictly disjoint from the box of (a, b, c),
+        the same box test _triangles_conflict starts with (order of query() kept)."""
+        min_x = min(a.x, b.x, c.x)
+        max_x = max(a.x, b.x, c.x)
+        min_y = min(a.y, b.y, c.y)
+        max_y = max(a.y, b.y, c.y)
+        boxes = self.boxes
+        out = []
+        for i in self.query(a, b, c):
+            x0, x1, y0, y1 = boxes[i]
+            if max_x < x0 or x1 < min_x or max_y < y0 or y1 < min_y:
+                continue
+            out.append(i)
+        return out
+
+
+class _LazyPositions:
+    """Front positions of (length, seq) entries, computed on iteration: the scan usually stops at the
+    first few edges. Valid while the front is unchanged (one _find_advancement call)."""
+
+    def __init__(self, entries: list[tuple[float, int]], seqs: list[int]) -> None:
+        self._entries = entries
+        self._seqs = seqs
+
+    def __iter__(self):
+        seqs = self._seqs
+        for _, seq in self._entries:
+            yield bisect_left(seqs, seq)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+
+class _IncrementalFront:
+    """The active front with its segment grid and length order, updated one edge at a time.
+
+    Every edge gets an increasing sequence number. Edges are only appended or removed, so an edge's
+    position in `front` is the rank of its number among live edges; grid queries and the priority
+    order are reported in positions, exactly as if they were rebuilt from `front` each iteration."""
+
+    def __init__(self, front: list[FrontEdge], scale_hint: float) -> None:
+        self.front = front
+        # Same cell size as AdvancingFrontMesher._build_segment_spatial_index.
+        self.cell_size = max(scale_hint * 1.5, 1e-6)
+        self._seqs: list[int] = []
+        self._cells: dict[tuple[int, int], list[int]] = {}
+        self._edge_info: dict[int, tuple[list[tuple[int, int]], float]] = {}
+        self._by_length: list[tuple[float, int]] = []
+        self._next_seq = 0
+        for edge in front:
+            seq = self._register(edge)
+            self._by_length.append((self._edge_info[seq][1], seq))
+        self._by_length.sort()
+
+    def _register(self, edge: FrontEdge) -> int:
+        seq = self._next_seq
+        self._next_seq += 1
+        self._seqs.append(seq)
+        a, b = edge
+        ax, ay, bx, by = a.x, a.y, b.x, b.y
+        cs = self.cell_size
+        x0 = int((ax if ax <= bx else bx) // cs)
+        x1 = int((bx if ax <= bx else ax) // cs)
+        y0 = int((ay if ay <= by else by) // cs)
+        y1 = int((by if ay <= by else ay) // cs)
+        cells = [(gx, gy) for gx in range(x0, x1 + 1) for gy in range(y0, y1 + 1)]
+        for cell in cells:
+            self._cells.setdefault(cell, []).append(seq)
+        length = sqrt((bx - ax) ** 2 + (by - ay) ** 2)
+        self._edge_info[seq] = (cells, length)
+        return seq
+
+    def append(self, edge: FrontEdge) -> None:
+        self.front.append(edge)
+        insort(self._by_length, (self._edge_info[self._register(edge)][1], self._next_seq - 1))
+
+    def pop(self, position: int) -> FrontEdge:
+        seq = self._seqs.pop(position)
+        cells, length = self._edge_info.pop(seq)
+        for cell in cells:
+            self._cells[cell].remove(seq)
+        del self._by_length[bisect_left(self._by_length, (length, seq))]
+        return self.front.pop(position)
+
+    def sorted_positions(self, max_scan: int | None) -> _LazyPositions:
+        """Positions ordered by edge length, ties by position (a stable sort of the front)."""
+        entries = self._by_length if max_scan is None or max_scan >= len(self.front) else self._by_length[:max_scan]
+        return _LazyPositions(entries, self._seqs)
+
+    def get(self, cell: tuple[int, int], default: list[int]) -> list[int]:
+        """Grid cell lookup with the dict interface of _build_segment_spatial_index (positions ascending)."""
+        members = self._cells.get(cell)
+        if not members:
+            return default
+        seqs = self._seqs
+        return [bisect_left(seqs, seq) for seq in members]
+
+    def positions_near(self, point: Point, reach: float) -> list[int]:
+        """Positions (ascending) of edges whose grid cells cover the box of half-size `reach` around point."""
+        cs = self.cell_size
+        found: set[int] = set()
+        for gx in range(int((point.x - reach) // cs), int((point.x + reach) // cs) + 1):
+            for gy in range(int((point.y - reach) // cs), int((point.y + reach) // cs) + 1):
+                found.update(self._cells.get((gx, gy), ()))
+        seqs = self._seqs
+        return sorted(bisect_left(seqs, seq) for seq in found)
 
 
 def _afm_debug(event: str, **fields: object) -> None:
@@ -143,6 +257,18 @@ class AdvancingFrontMesher(IMeshGenerator):
         self._deadline: float | None = None
         # Triangles already built in the current AFM pass; None outside of a pass.
         self._built_index: _TriangleSpatialIndex | None = None
+        # Front edges whose candidate search failed, keyed by (a, b), with the box around the edge
+        # that the search depends on. Valid only within one pass; None disables the cache.
+        self._failed_edges: dict[tuple[Point, Point], tuple[float, float, float, float]] | None = None
+        self._snap_tie_seen = False
+        # Front vertices of the front being scanned by _find_advancement: (front, vertices).
+        self._scan_front_vertices: tuple[list[FrontEdge], list[Point]] | None = None
+        # Per hole ring (by identity): (ring, bounding box, edges).
+        self._hole_geometry: dict[int, tuple[list[Point], tuple[float, float, float, float], list[FrontEdge]]] = {}
+        # Per ring (by identity): (ring, row index for point-in-polygon).
+        self._ring_row_cache: dict[int, tuple[list[Point], PolygonRowIndex]] = {}
+        # Incremental front of the current AFM pass; None outside of a pass.
+        self._front_index: _IncrementalFront | None = None
         # Seconds per stage of the last generate_with_holes_and_cuts call (all passes, failed ones too).
         self.last_stage_timings: dict[str, float] = {"afm": 0.0, "postprocess": 0.0, "numbering": 0.0}
 
@@ -269,6 +395,21 @@ class AdvancingFrontMesher(IMeshGenerator):
             raise ValueError("AFM failed to generate mesh.")
         return best_mesh
 
+    def cut_rejection_reason(
+            self,
+            boundary: list[Point],
+            holes: list[list[Point]],
+            cut: list[Point],
+    ) -> str | None:
+        """Why `cut` on its own cannot be meshed with this boundary and holes; None when it can."""
+        try:
+            polygon = self._prepare_boundary(boundary)
+            hole_polygons = [self._prepare_hole_boundary(hole) for hole in holes if hole]
+            self._prepare_cuts([cut], polygon, hole_polygons, tolerance=max(_EPSILON * 100.0, 1e-6))
+        except ValueError as error:
+            return str(error)
+        return None
+
     def _generate_single_pass(
             self,
             polygon: list[Point],
@@ -294,6 +435,12 @@ class AdvancingFrontMesher(IMeshGenerator):
             int(_MAX_FRONT_EDGES_PER_CELL * domain_area / (target_h * target_h)),
         )
         self._built_index = _TriangleSpatialIndex(cell_size=target_h * 1.5)
+        self._failed_edges = {}
+        # Ring caches are keyed by identity; the rings of earlier passes are no longer used.
+        self._hole_geometry.clear()
+        self._ring_row_cache.clear()
+        front_index = _IncrementalFront(front, target_h)
+        self._front_index = front_index
 
         max_iterations = max(200, len(front) * self._max_iterations_factor)
         iterations = 0
@@ -334,11 +481,12 @@ class AdvancingFrontMesher(IMeshGenerator):
                     break
 
                 active_idx, a, b, candidate = advancement
-                front.pop(active_idx)
+                front_index.pop(active_idx)
 
                 triangle = Triangle(a, b, candidate)
                 triangles.append(triangle)
                 self._built_index.insert(a, b, candidate)
+                self._forget_failed_edges_near(a, b, candidate)
                 meshed_area += triangle.area()
                 self._update_front(front, (a, candidate))
                 self._update_front(front, (candidate, b))
@@ -351,6 +499,8 @@ class AdvancingFrontMesher(IMeshGenerator):
                     raise ValueError("AFM front grew beyond the safe limit (runaway front).")
         finally:
             self._built_index = None
+            self._failed_edges = None
+            self._front_index = None
 
         if front:
             _afm_debug(
@@ -577,6 +727,10 @@ class AdvancingFrontMesher(IMeshGenerator):
 
         return self._split_cut_segments(segments, tolerance)
 
+    def resolve_target_step(self, boundary: list[Point]) -> float:
+        """Base meshing step for this boundary (the first AFM pass uses exactly this step)."""
+        return self._resolve_target_step(boundary)
+
     def _resolve_target_step(self, boundary: list[Point]) -> float:
         if self._target_edge_length is not None:
             perimeter = 0.0
@@ -671,10 +825,12 @@ class AdvancingFrontMesher(IMeshGenerator):
         return [(polygon[i], polygon[(i + 1) % len(polygon)]) for i in range(len(polygon))]
 
     def _sorted_front_indices_by_priority(self, front: list[FrontEdge], max_scan: int | None = None) -> list[int]:
-        indices = range(len(front))
+        # Same value as distance(); heapq.nsmallest(k, ...) equals sorted(...)[:k], ties included.
+        lengths = [sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2) for a, b in front]
+        indices = sorted(range(len(front)), key=lengths.__getitem__)
         if max_scan is None or max_scan >= len(front):
-            return sorted(indices, key=lambda i: distance(front[i][0], front[i][1]))
-        return heapq.nsmallest(max_scan, indices, key=lambda i: distance(front[i][0], front[i][1]))
+            return indices
+        return indices[:max_scan]
 
     def _find_advancement(
             self,
@@ -688,12 +844,47 @@ class AdvancingFrontMesher(IMeshGenerator):
             max_scan = min(len(front), max(_MAX_FRONT_CANDIDATE_SCAN, len(front) // 3))
         else:
             max_scan = min(len(front), _MAX_FRONT_CANDIDATE_SCAN)
-        sorted_indices = self._sorted_front_indices_by_priority(front, max_scan=max_scan)
+        front_index = self._front_index
+        if front_index is not None and front_index.front is front:
+            sorted_indices = front_index.sorted_positions(max_scan)
+            front_spatial_index, front_cell_size = front_index, front_index.cell_size
+        else:
+            sorted_indices = self._sorted_front_indices_by_priority(front, max_scan=max_scan)
+            front_spatial_index, front_cell_size = self._build_segment_spatial_index(front, target_step)
         all_front_vertices = self._front_vertices(front, exclude=set())
-        front_spatial_index, front_cell_size = self._build_segment_spatial_index(front, target_step)
+        self._scan_front_vertices = (front, all_front_vertices)
+        try:
+            return self._scan_front_for_advancement(
+                front,
+                polygon,
+                holes,
+                cut_segments,
+                target_step,
+                sorted_indices,
+                all_front_vertices,
+                front_spatial_index,
+                front_cell_size,
+            )
+        finally:
+            self._scan_front_vertices = None
 
+    def _scan_front_for_advancement(
+            self,
+            front: list[FrontEdge],
+            polygon: list[Point],
+            holes: list[list[Point]],
+            cut_segments: list[Segment],
+            target_step: float,
+            sorted_indices: list[int],
+            all_front_vertices: list[Point],
+            front_spatial_index: dict[tuple[int, int], list[int]],
+            front_cell_size: float,
+    ) -> tuple[int, Point, Point, Point] | None:
         for idx in sorted_indices:
             a, b = front[idx]
+            if self._edge_search_known_to_fail(a, b):
+                continue
+            self._snap_tie_seen = False
             candidate = self._find_best_node(
                 a,
                 b,
@@ -708,6 +899,7 @@ class AdvancingFrontMesher(IMeshGenerator):
             )
             if candidate is not None:
                 return idx, a, b, candidate
+            self._remember_failed_edge(a, b, target_step)
         # Recovery path: if no candidate found for edge direction (a->b),
         # try reversed orientation (b->a). This helps on residual fronts
         # where local edge orientation becomes inconsistent near closure.
@@ -715,6 +907,9 @@ class AdvancingFrontMesher(IMeshGenerator):
         # check against built triangles), so it cannot re-fill already meshed area.
         for idx in sorted_indices:
             a, b = front[idx]
+            if self._edge_search_known_to_fail(b, a):
+                continue
+            self._snap_tie_seen = False
             candidate = self._find_best_node(
                 b,
                 a,
@@ -730,7 +925,41 @@ class AdvancingFrontMesher(IMeshGenerator):
             if candidate is not None:
                 _afm_debug("afm.recovery.reversed_edge_used", edge_idx=idx)
                 return idx, b, a, candidate
+            self._remember_failed_edge(b, a, target_step)
         return None
+
+    # A failed candidate search for edge (a, b) only looks at front vertices, front edges and built
+    # triangles within 2.5*|ab| (+ Steiner snap radius) of the edge midpoint; domain, holes and cuts
+    # are fixed during a pass. Every advancement changes the front and the built triangles only
+    # inside the new triangle, so the failure stays valid until a new triangle touches that box.
+    def _edge_search_known_to_fail(self, a: Point, b: Point) -> bool:
+        return self._failed_edges is not None and (a, b) in self._failed_edges
+
+    def _remember_failed_edge(self, a: Point, b: Point, target_step: float) -> None:
+        # A distance tie in Steiner snapping is resolved by set order, which can change with
+        # unrelated front edits; such searches are not cached.
+        if self._failed_edges is None or self._snap_tie_seen:
+            return
+        edge_len = distance(a, b)
+        reach = 2.6 * edge_len + target_step + 1e-3
+        mx = (a.x + b.x) / 2.0
+        my = (a.y + b.y) / 2.0
+        self._failed_edges[(a, b)] = (mx - reach, mx + reach, my - reach, my + reach)
+
+    def _forget_failed_edges_near(self, a: Point, b: Point, c: Point) -> None:
+        if not self._failed_edges:
+            return
+        min_x = min(a.x, b.x, c.x)
+        max_x = max(a.x, b.x, c.x)
+        min_y = min(a.y, b.y, c.y)
+        max_y = max(a.y, b.y, c.y)
+        stale = [
+            key
+            for key, (x0, x1, y0, y1) in self._failed_edges.items()
+            if x0 <= max_x and min_x <= x1 and y0 <= max_y and min_y <= y1
+        ]
+        for key in stale:
+            del self._failed_edges[key]
 
     def _find_best_node(
             self,
@@ -750,10 +979,11 @@ class AdvancingFrontMesher(IMeshGenerator):
             return None
 
         midpoint = Point((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)
+        # a and b are dropped later, only from vertices near the edge (the filter order is kept).
         if all_front_vertices is None:
             existing_vertices = self._front_vertices(front, exclude={a, b})
         else:
-            existing_vertices = [p for p in all_front_vertices if p != a and p != b]
+            existing_vertices = all_front_vertices
 
         # 1) Prefer interior growth via Steiner points.
         if edge_len > target_step * self._steiner_activation_length_factor:
@@ -804,10 +1034,16 @@ class AdvancingFrontMesher(IMeshGenerator):
         # Distances to the edge midpoint are computed once and shared by the near (radius L)
         # and far (radius 2.5L) closure passes; the stable sort keeps the original order.
         closure_radius = edge_len * 2.5
+        # A coordinate gap above the box half-size already puts the distance above the radius.
+        box_half = closure_radius * (1.0 + 1e-9) + _EPSILON
+        mx = midpoint.x
+        my = midpoint.y
         by_distance: list[tuple[float, Point]] = []
         for p in existing_vertices:
-            d = sqrt((midpoint.x - p.x) ** 2 + (midpoint.y - p.y) ** 2)
-            if d <= closure_radius:
+            if abs(mx - p.x) > box_half or abs(my - p.y) > box_half:
+                continue
+            d = sqrt((mx - p.x) ** 2 + (my - p.y) ** 2)
+            if d <= closure_radius and p != a and p != b:
                 by_distance.append((d, p))
         by_distance.sort(key=lambda item: item[0])
 
@@ -965,11 +1201,34 @@ class AdvancingFrontMesher(IMeshGenerator):
             polygon: list[Point],
             holes: list[list[Point]],
     ) -> bool:
-        if not point_in_polygon(point, polygon, include_boundary=True):
+        if not self._ring_rows(polygon).contains(point, include_boundary=True):
             return False
-        if any(point_in_polygon(point, hole, include_boundary=False) for hole in holes):
-            return False
+        for hole in holes:
+            x0, x1, y0, y1 = self._hole_bounds_and_edges(hole)[0]
+            if point.x < x0 or point.x > x1 or point.y < y0 or point.y > y1:
+                continue
+            if self._ring_rows(hole).contains(point, include_boundary=False):
+                return False
         return True
+
+    def _ring_rows(self, ring: list[Point]) -> PolygonRowIndex:
+        """Row index of a ring for point_in_polygon, cached by ring identity."""
+        entry = self._ring_row_cache.get(id(ring))
+        if entry is None or entry[0] is not ring:
+            entry = (ring, PolygonRowIndex(ring))
+            self._ring_row_cache[id(ring)] = entry
+        return entry[1]
+
+    def _hole_bounds_and_edges(self, hole: list[Point]) -> tuple[tuple[float, float, float, float], list[FrontEdge]]:
+        """Bounding box (widened by _BOX_MARGIN) and edges of a hole ring, cached by ring identity."""
+        entry = self._hole_geometry.get(id(hole))
+        if entry is None or entry[0] is not hole:
+            xs = [p.x for p in hole]
+            ys = [p.y for p in hole]
+            box = (min(xs) - _BOX_MARGIN, max(xs) + _BOX_MARGIN, min(ys) - _BOX_MARGIN, max(ys) + _BOX_MARGIN)
+            entry = (hole, box, self._polygon_edges(hole))
+            self._hole_geometry[id(hole)] = entry
+        return entry[1], entry[2]
 
     def _triangle_respects_holes(
             self,
@@ -979,12 +1238,39 @@ class AdvancingFrontMesher(IMeshGenerator):
             holes: list[list[Point]],
     ) -> bool:
         triangle_edges = ((a, b), (b, c), (c, a))
+        min_x = min(a.x, b.x, c.x)
+        max_x = max(a.x, b.x, c.x)
+        min_y = min(a.y, b.y, c.y)
+        max_y = max(a.y, b.y, c.y)
         for obstacle in holes:
-            if any(point_in_polygon(point, obstacle, include_boundary=False) for point in (a, b, c)):
+            (x0, x1, y0, y1), obstacle_edges = self._hole_bounds_and_edges(obstacle)
+            # Disjoint boxes: no vertex inside the hole, no crossing, no hole vertex inside the triangle.
+            if max_x < x0 or min_x > x1 or max_y < y0 or min_y > y1:
+                continue
+            obstacle_rows = self._ring_rows(obstacle)
+            if any(
+                    x0 <= point.x <= x1 and y0 <= point.y <= y1
+                    and obstacle_rows.contains(point, include_boundary=False)
+                    for point in (a, b, c)
+            ):
                 return False
 
             for triangle_edge in triangle_edges:
-                for obstacle_edge in self._polygon_edges(obstacle):
+                p, q = triangle_edge
+                ex0 = (p.x if p.x <= q.x else q.x) - _BOX_MARGIN
+                ex1 = (q.x if p.x <= q.x else p.x) + _BOX_MARGIN
+                ey0 = (p.y if p.y <= q.y else q.y) - _BOX_MARGIN
+                ey1 = (q.y if p.y <= q.y else p.y) + _BOX_MARGIN
+                for obstacle_edge in obstacle_edges:
+                    u, v = obstacle_edge
+                    # Edges with disjoint boxes cannot cross.
+                    if (
+                            (u.x < ex0 and v.x < ex0)
+                            or (u.x > ex1 and v.x > ex1)
+                            or (u.y < ey0 and v.y < ey0)
+                            or (u.y > ey1 and v.y > ey1)
+                    ):
+                        continue
                     if self._same_edge(triangle_edge, obstacle_edge):
                         continue
                     if segments_intersect(
@@ -997,6 +1283,8 @@ class AdvancingFrontMesher(IMeshGenerator):
                         return False
 
             for point in obstacle:
+                if point.x < min_x or point.x > max_x or point.y < min_y or point.y > max_y:
+                    continue
                 if point in (a, b, c):
                     continue
                 if self._point_in_triangle_strict(point, a, b, c):
@@ -1005,6 +1293,23 @@ class AdvancingFrontMesher(IMeshGenerator):
 
     def _triangle_respects_cut_segments(self, a: Point, b: Point, c: Point, cut_segments: list[Segment]) -> bool:
         triangle_edges = ((a, b), (b, c), (c, a))
+        # Cut segments whose box (widened past the touch tolerance) misses the triangle's box can
+        # neither cross nor touch it; only the remaining ones go through the checks below.
+        margin = _CUT_TOUCH_TOLERANCE * 10.0 + _BOX_MARGIN
+        min_x = min(a.x, b.x, c.x) - margin
+        max_x = max(a.x, b.x, c.x) + margin
+        min_y = min(a.y, b.y, c.y) - margin
+        max_y = max(a.y, b.y, c.y) + margin
+        cut_segments = [
+            segment
+            for segment in cut_segments
+            if not (
+                    (segment[0].x < min_x and segment[1].x < min_x)
+                    or (segment[0].x > max_x and segment[1].x > max_x)
+                    or (segment[0].y < min_y and segment[1].y < min_y)
+                    or (segment[0].y > max_y and segment[1].y > max_y)
+            )
+        ]
         for edge in triangle_edges:
             for cut_segment in cut_segments:
                 if self._same_undirected_edge(edge, cut_segment):
@@ -1021,6 +1326,10 @@ class AdvancingFrontMesher(IMeshGenerator):
                     return False
         for cut_segment in cut_segments:
             # A cut segment starting at a triangle vertex must not run into the triangle's interior.
+            # The triangle's own edges are skipped: their midpoint is on the edge, and rounding could
+            # put it "inside".
+            if any(self._same_undirected_edge(edge, cut_segment) for edge in triangle_edges):
+                continue
             mid = Point((cut_segment[0].x + cut_segment[1].x) / 2.0, (cut_segment[0].y + cut_segment[1].y) / 2.0)
             sides = {orientation(a, b, mid), orientation(b, c, mid), orientation(c, a, mid)}
             if sides == {1} or sides == {-1}:
@@ -1069,14 +1378,17 @@ class AdvancingFrontMesher(IMeshGenerator):
         cell_size = max(scale_hint * 1.5, 1e-6)
         grid: dict[tuple[int, int], list[int]] = defaultdict(list)
         for idx, (a, b) in enumerate(segments):
-            min_x = min(a.x, b.x)
-            max_x = max(a.x, b.x)
-            min_y = min(a.y, b.y)
-            max_y = max(a.y, b.y)
-            x0 = int(min_x // cell_size)
-            x1 = int(max_x // cell_size)
-            y0 = int(min_y // cell_size)
-            y1 = int(max_y // cell_size)
+            ax = a.x
+            bx = b.x
+            ay = a.y
+            by = b.y
+            x0 = int((ax if ax <= bx else bx) // cell_size)
+            x1 = int((bx if ax <= bx else ax) // cell_size)
+            y0 = int((ay if ay <= by else by) // cell_size)
+            y1 = int((by if ay <= by else ay) // cell_size)
+            if x0 == x1 and y0 == y1:
+                grid[(x0, y0)].append(idx)
+                continue
             for gx in range(x0, x1 + 1):
                 for gy in range(y0, y1 + 1):
                     grid[(gx, gy)].append(idx)
@@ -1105,7 +1417,21 @@ class AdvancingFrontMesher(IMeshGenerator):
 
     def _contains_front_vertex(self, a: Point, b: Point, c: Point, front: list[FrontEdge]) -> bool:
         """A front vertex strictly inside the triangle or inside one of its sides (hanging node)."""
-        for p in self._front_vertices(front, exclude={a, b, c}):
+        scan = self._scan_front_vertices
+        if scan is not None and scan[0] is front:
+            vertices = scan[1]
+        else:
+            vertices = self._front_vertices(front, exclude={a, b, c})
+        margin = _ON_EDGE_RELATIVE_TOLERANCE * max(distance(a, b), distance(b, c), distance(c, a), 1.0) + _BOX_MARGIN
+        min_x = min(a.x, b.x, c.x) - margin
+        max_x = max(a.x, b.x, c.x) + margin
+        min_y = min(a.y, b.y, c.y) - margin
+        max_y = max(a.y, b.y, c.y) + margin
+        for p in vertices:
+            if p.x < min_x or p.x > max_x or p.y < min_y or p.y > max_y:
+                continue
+            if p == a or p == b or p == c:
+                continue
             o1 = orientation(a, b, p)
             o2 = orientation(b, c, p)
             o3 = orientation(c, a, p)
@@ -1122,10 +1448,22 @@ class AdvancingFrontMesher(IMeshGenerator):
     def _front_vertices(self, front: list[FrontEdge], exclude: set[Point]) -> list[Point]:
         vertices = {edge[0] for edge in front}
         vertices.update(edge[1] for edge in front)
+        if not exclude:
+            return list(vertices)
         return [p for p in vertices if p not in exclude]
 
     def _update_front(self, front: list[FrontEdge], new_edge: FrontEdge) -> None:
         reverse = (new_edge[1], new_edge[0])
+        front_index = self._front_index
+        if front_index is not None and front_index.front is front:
+            # A matching edge starts within _EPSILON of reverse[0], so it lies in the cells around it;
+            # the first match in front order is popped, as in the scan below.
+            for i in front_index.positions_near(reverse[0], 2.0 * _EPSILON):
+                if self._same_edge(front[i], reverse):
+                    front_index.pop(i)
+                    return
+            front_index.append(new_edge)
+            return
         for i, edge in enumerate(front):
             if self._same_edge(edge, reverse):
                 front.pop(i)
@@ -1133,6 +1471,10 @@ class AdvancingFrontMesher(IMeshGenerator):
         front.append(new_edge)
 
     def _same_edge(self, e1: FrontEdge, e2: FrontEdge) -> bool:
+        # A coordinate gap above 2*_EPSILON already puts the distance above _EPSILON.
+        p, q = e1[0], e2[0]
+        if abs(p.x - q.x) > 2.0 * _EPSILON or abs(p.y - q.y) > 2.0 * _EPSILON:
+            return False
         return distance(e1[0], e2[0]) <= _EPSILON and distance(e1[1], e2[1]) <= _EPSILON
 
     def _same_undirected_edge(self, e1: FrontEdge, e2: FrontEdge) -> bool:
@@ -1569,10 +1911,37 @@ class AdvancingFrontMesher(IMeshGenerator):
                 raise ValueError("Cut intersects hole interior.")
             for hole in holes:
                 for edge in self._polygon_edges(hole):
-                    if segments_intersect(a, b, edge[0], edge[1], include_endpoints=True):
+                    if not segments_intersect(a, b, edge[0], edge[1], include_endpoints=True):
+                        continue
+                    # Like on the outer boundary, a cut may end on a hole boundary: the end point then
+                    # becomes a hole vertex. Crossing, running along or touching it elsewhere is invalid.
+                    if not self._cut_segment_touches_hole_edge_at_end(
+                            a, b, edge, a_is_cut_end=i == 0, b_is_cut_end=i == len(cut) - 2
+                    ):
                         raise ValueError("Cut intersects or touches hole boundary.")
 
         self._ensure_cut_no_self_intersection(cut)
+
+    def _cut_segment_touches_hole_edge_at_end(
+            self,
+            a: Point,
+            b: Point,
+            edge: Segment,
+            a_is_cut_end: bool,
+            b_is_cut_end: bool,
+    ) -> bool:
+        if segments_intersect(a, b, edge[0], edge[1], include_endpoints=False):
+            return False
+        if any(self._point_inside_segment(vertex, a, b) for vertex in edge):
+            return False
+
+        def on_edge(p: Point) -> bool:
+            return p == edge[0] or p == edge[1] or self._point_inside_segment(p, edge[0], edge[1])
+
+        a_on, b_on = on_edge(a), on_edge(b)
+        if a_on and b_on:
+            return False
+        return (a_on and a_is_cut_end) or (b_on and b_is_cut_end)
 
     def _ensure_cut_no_self_intersection(self, cut: list[Point]) -> None:
         edges = [(cut[i], cut[i + 1]) for i in range(len(cut) - 1)]
@@ -1603,6 +1972,11 @@ class AdvancingFrontMesher(IMeshGenerator):
                     intersection = self._segment_intersection_point(first[0], first[1], second[0], second[1], tolerance)
                     if intersection is None:
                         continue
+                    # Reuse an existing endpoint: a recomputed crossing differs from it by rounding and
+                    # would split the junction node into two nearly coincident ones.
+                    intersection = self._snap_point_to_vertices(
+                        intersection, [first[0], first[1], second[0], second[1]], tolerance
+                    )
                     if not self._point_is_endpoint(intersection, first, tolerance):
                         split_points_first.append(intersection)
                         changed = True
@@ -1611,6 +1985,8 @@ class AdvancingFrontMesher(IMeshGenerator):
                         split_points_second = [second[0], intersection, second[1]]
                         next_segments.extend(self._segments_from_points(split_points_second, tolerance))
                         changed = True
+                start = first[0]
+                split_points_first.sort(key=lambda p: distance(start, p))
                 next_segments.extend(self._segments_from_points(split_points_first, tolerance))
             current = self._dedupe_segments(next_segments, tolerance)
         return current
@@ -1692,7 +2068,9 @@ class AdvancingFrontMesher(IMeshGenerator):
             prev = a
             for j in range(1, k + 1):
                 t = j / k
-                curr = Point(
+                # The last piece ends exactly at b: a + (b - a) * 1 can differ from a non-integer b
+                # (e.g. a cut crossing point) by rounding and would split one node into two.
+                curr = b if j == k else Point(
                     a.x + (b.x - a.x) * t,
                     a.y + (b.y - a.y) * t,
                     )
@@ -1739,6 +2117,8 @@ class AdvancingFrontMesher(IMeshGenerator):
             d = distance(point, v)
             if d < best_distance:
                 best, best_distance = v, d
+            elif d == best_distance and best is not None:
+                self._snap_tie_seen = True
         return best
 
     def _improve_topology(self, mesh: Mesh, fixed_points: list[Point], cut_segments: list[Segment]) -> Mesh:
@@ -1829,7 +2209,7 @@ class AdvancingFrontMesher(IMeshGenerator):
         if index is None:
             return False
         candidate = (a, b, c)
-        return any(self._triangles_conflict(candidate, index.triangles[i]) for i in index.query(a, b, c))
+        return any(self._triangles_conflict(candidate, index.triangles[i]) for i in index.query_box_overlaps(a, b, c))
 
     def _validate_final_mesh(self, mesh: Mesh, domain_area: float) -> None:
         """Raise ValueError unless the triangles tile the domain: total area matches, interiors do
@@ -1843,7 +2223,7 @@ class AdvancingFrontMesher(IMeshGenerator):
         longest = max(distance(p, q) for t in triangles for p, q in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])))
         index = _TriangleSpatialIndex(cell_size=longest)
         for i, triangle in enumerate(triangles):
-            for j in index.query(*triangle):
+            for j in index.query_box_overlaps(*triangle):
                 if self._triangles_conflict(triangle, index.triangles[j]):
                     raise ValueError(f"Mesh validation failed: triangles {j} and {i} overlap or form a hanging node.")
             index.insert(*triangle)
@@ -1855,11 +2235,13 @@ class AdvancingFrontMesher(IMeshGenerator):
     ) -> bool:
         """True when two CCW triangles overlap in their interiors, or a vertex of one lies strictly
         inside the other or inside one of its sides. Sharing a vertex or an edge is fine."""
+        f0, f1, f2 = first
+        s0, s1, s2 = second
         if (
-                max(p.x for p in first) < min(p.x for p in second)
-                or max(p.x for p in second) < min(p.x for p in first)
-                or max(p.y for p in first) < min(p.y for p in second)
-                or max(p.y for p in second) < min(p.y for p in first)
+                max(f0.x, f1.x, f2.x) < min(s0.x, s1.x, s2.x)
+                or max(s0.x, s1.x, s2.x) < min(f0.x, f1.x, f2.x)
+                or max(f0.y, f1.y, f2.y) < min(s0.y, s1.y, s2.y)
+                or max(s0.y, s1.y, s2.y) < min(f0.y, f1.y, f2.y)
         ):
             return False
         shared = [p for p in first if p in second]

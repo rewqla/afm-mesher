@@ -5,6 +5,11 @@ from pathlib import Path
 
 from PIL import Image
 
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - pure-Python fallback below
+    np = None  # type: ignore[assignment]
+
 from src.domain.entities.point import Point
 
 Mask = list[list[int]]
@@ -74,6 +79,8 @@ def _validate_mask(mask: Mask) -> None:
 
 
 def _build_boundary_edges(mask: Mask) -> list[Edge]:
+    if np is not None:
+        return _build_boundary_edges_numpy(mask)
     height = len(mask)
     width = len(mask[0])
     edges: list[Edge] = []
@@ -96,6 +103,34 @@ def _build_boundary_edges(mask: Mask) -> list[Edge]:
             if x == 0 or mask[y][x - 1] == 0:
                 edges.append(((x, y + 1), (x, y)))
 
+    return edges
+
+
+def _build_boundary_edges_numpy(mask: Mask) -> list[Edge]:
+    """Same edges in the same order as the pixel loop: row by row, pixel by pixel, then
+    top, right, bottom, left side."""
+    filled = np.asarray(mask) != 0
+    padded = np.pad(filled, 1, constant_values=False)
+    sides = np.stack(
+        (
+            filled & ~padded[:-2, 1:-1],  # top neighbour empty or outside
+            filled & ~padded[1:-1, 2:],  # right
+            filled & ~padded[2:, 1:-1],  # bottom
+            filled & ~padded[1:-1, :-2],  # left
+        ),
+        axis=-1,
+    )
+    ys, xs, kinds = np.nonzero(sides)  # row-major: (y, x, side) ascending
+    edges: list[Edge] = []
+    for y, x, kind in zip(ys.tolist(), xs.tolist(), kinds.tolist()):
+        if kind == 0:
+            edges.append(((x, y), (x + 1, y)))
+        elif kind == 1:
+            edges.append(((x + 1, y), (x + 1, y + 1)))
+        elif kind == 2:
+            edges.append(((x + 1, y + 1), (x, y + 1)))
+        else:
+            edges.append(((x, y + 1), (x, y)))
     return edges
 
 
