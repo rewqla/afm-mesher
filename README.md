@@ -1,229 +1,94 @@
 # AFM Mesher
 
-Проєкт для побудови 2D трикутної сітки методом **Advancing Front Method (AFM)** з:
-- обробкою бінарних зображень (виділення зовнішнього контуру),
-- генерацією сітки всередині контуру,
-- оцінкою якості сітки,
-- експортом у `OBJ`, `PLY`, `VTK`,
-- інтерактивним UI-редактором маски.
+Triangulation of planar domains with inclusions and zero-thickness cuts by the advancing front method, with a single continuous numbering of nodes and triangles.
 
-## Що реалізує проєкт
+The program takes a domain (an outer boundary, inclusions and cuts), builds a conforming triangular mesh, and exports it. It is the software part of the paper *Triangulation of planar domains with inclusions and cuts by the advancing front method with continuous node numbering* (Mosiichuk Yu., Martyniuk P.).
 
-Основний сценарій: взяти контур фігури (зображення або намальована маска) і отримати триангуляцію області.
+## What it does
 
-Пайплайн:
-1. Бінаризація зображення (`threshold`).
-2. Виділення граничних ребер і зшивання в контури.
-3. Спрощення контуру (Ramer-Douglas-Peucker, `epsilon`).
-4. AFM-триангуляція (front-ребра, підбір кандидатів, перевірка валідності трикутників).
-5. Пост-обробка (Laplacian smoothing).
-6. Розрахунок метрик якості (min/mean/max + гістограма).
-7. Експорт/візуалізація.
+- **Domain input.** Draw the domain in the graphical editor, load a raster image (contours are extracted from it), or import a JSON file with coordinates.
+- **Inclusions.** An inclusion is either a *hole* (excluded from the mesh) or a *subdomain* (meshed together with the main region, with the common boundary discretized identically on both sides).
+- **Cuts.** A cut is an open polyline of zero thickness. Each cut segment enters the advancing front twice, in opposite directions, so the mesh grows on both sides and both banks are made of the same chain of mesh edges.
+- **Meshing.** Advancing front with Steiner points; ear clipping as a fallback for the remaining front; edge flips, removal of valence-3 nodes and Laplacian smoothing afterwards.
+- **Numbering.** One continuous numbering of nodes and of triangles. Nodes on cuts and subdomain interfaces are split into twins (one number per side), and every node gets a type: interior, boundary or interface.
+- **Bandwidth reduction.** Multi-start reverse Cuthill–McKee renumbering of the nodes to reduce the bandwidth of the global matrix.
+- **Export.** JSON (nodes with types and twin groups, triangles with subdomain numbers, mesh statistics) and `OBJ`, `PLY`, `VTK`.
 
-## Алгоритми
+## Installation
 
-### Назви застосованих алгоритмів
+Python 3 is required (developed and run with Python 3.14).
 
-- **Advancing Front Method (AFM)** — основна триангуляція області.
-- **Laplacian Smoothing** — згладжування внутрішніх вузлів сітки.
-- **Ramer-Douglas-Peucker (RDP)** — спрощення контуру (`epsilon`).
-- **Ear Clipping Triangulation** — fallback-триангуляція при зупинці фронту.
-- **Ray Casting Point-in-Polygon test** — перевірка належності точки полігону.
-- **Segment Intersection Test (orientation-based)** — перевірка перетинів ребер.
-
-### 1) Виділення межі з маски
-- `src/infrastructure/image/photo_preprocessor.py`
-- `src/infrastructure/processing/image_boundary_extractor.py`
-- `src/infrastructure/processing/stroke_centerline_extractor.py`
-
-Ключові ідеї:
-- межа формується з ребер foreground-пікселів;
-- ребра зшиваються в замкнені контури;
-- для складних випадків обирається найбільший зовнішній контур за площею;
-- контур спрощується RDP (`simplify_contour`).
-- для завантажених відкритих штрихів окремо витягується `centerline` через скелетизацію
-  (Zhang-Suen thinning + tracing connected component), щоб валідатор працював з полілінією
-  штриха, а не з товщиною чорної смуги.
-
-### 1.1) Валідація та постобробка контуру
-- `src/domain/geometry/contour_pipeline.py`
-- `src/application/services/boundary_validator.py`
-
-Поточний `Source of Truth` для векторного контуру:
-- всі user-drawn contours і contours, витягнуті із завантаженого зображення, проходять один і той самий
-  contour pipeline;
-- `BoundaryValidator` більше не має окремої геометричної логіки, а викликає `preprocess_contour`
-  і `validate_contour`.
-
-Алгоритм `preprocess_contour`:
-- видаляє послідовні дублікати точок за `epsilon`;
-- застосовує Ramer-Douglas-Peucker для прибирання мікро-зигзагів;
-- для сирого pen stroke шукає замикання від кінця до початку в межах `closure_tolerance`,
-  відрізає хвіст після точки замикання і робить hard snap `last = first`;
-- для already-closed contour (типово після image extraction) не трактує його як хвіст pen stroke
-  і зберігає явне замикання.
-
-Алгоритм `validate_contour`:
-- перевіряє, чи contour замкнений;
-- перевіряє самоперетини по відрізках;
-- ігнорує топологічно суміжні ребра;
-- окремо ловить дегенеративний розворот назад на сусідніх сегментах;
-- якщо є мікро-петля в зоні старт/фініш, пробує відновити найбільший валідний loop.
-
-Поведінка UI:
-- якщо contour не замкнений, триангуляція блокується;
-- в UI підсвічується лише останній open segment;
-- автодомальовування вимкнене.
-
-### 1.2) Домальовування контуру
-- `src/domain/geometry/contour_pipeline.py::smart_append_contour`
-- `src/presentation/canvas.py`
-
-Поточна логіка continuation:
-- при старті нового pen stroke `Canvas` шукає найближчий відкритий кінець існуючого contour;
-- continuation можливий як у `start`, так і в `end`;
-- орієнтація існуючого contour не перевертається глобально;
-- перші точки нового штриха проектуються на напрямок хвоста/голови базового contour,
-  щоб не утворювати шпору або зворотний гострий кут;
-- короткий corrective stroke теж приймається, якщо він продовжує вже існуючий open contour.
-
-### 2) Advancing Front Mesher
-- `src/application/services/advancing_front_mesher.py`
-
-Ключові кроки:
-- нормалізація boundary (видалення дублікатів, CCW-орієнтація, перевірка площі);
-- підподіл boundary до кроку `h` (`subdivide_boundary`);
-- підтримка active front (список ребер);
-- побудова кандидатів:
-  - Steiner-кандидати (вздовж нормалі + зсуви),
-  - підбір сусідніх існуючих вершин,
-  - розширений радіус замикання фронту;
-- геометричні перевірки:
-  - орієнтація, належність полігону,
-  - мінімальна якість трикутника,
-  - відсутність перетинів з front,
-  - відсутність включення сторонніх front-вершин;
-- fallback: ear clipping, якщо AFM-фронт зупинився.
-
-### 3) Покращення якості сітки
-
-Якість покращується не одним прийомом, а комбінацією:
-1. **Багатоспробна генерація**: до 4 спроб із зменшенням `h` (`h * 0.8^attempt`), вибір найкращої сітки за середньою якістю.
-2. **Контроль мінімальної якості трикутників** (`min_triangle_quality`) ще під час генерації.
-3. **Steiner-точки** для локального “вирівнювання” геометрії в місцях, де фронт інакше формує погані трикутники.
-4. **Laplacian smoothing** лише внутрішніх вузлів, із фіксацією boundary.
-5. **Перевірка орієнтації при згладжуванні** (не допускається переворот елементів).
-6. **Зовнішній quality-gate у тестах**: для базових і складних форм очікується середня якість `>= 0.7`.
-
-## Режими роботи
-
-### 1) Batch режим
-Команда:
 ```bash
-python src/main.py --mode batch
+pip install -r requirements.txt
 ```
 
-Що робить:
-- проганяє набір еталонних зображень із `data/images`,
-- будує сітки,
-- зберігає дебаг-візуалізації (`*_debug.png`),
-- експортує `obj/ply/vtk`,
+Dependencies: PySide6, Pillow, matplotlib, shapely, numpy (pinned in `requirements.txt`).
 
-### 2) UI режим
-Команда:
+## Usage
+
+Graphical editor:
+
 ```bash
 python src/main.py --mode ui
 ```
 
-Що доступно:
-- редактор маски (Pen, Eraser, Fill, Point, Segment, Rectangle, Circle),
-- undo/redo, load/save,
-- запуск триангуляції в окремому потоці.
+Batch run on the reference images in `data/images` (writes debug images and `OBJ`/`PLY`/`VTK` files to `data/output`):
 
-Пресети триангуляції в UI (`TriangulationAdapter`):
-- `Fast`
-- `Balanced`
-- `Accurate`
-- `Custom` (ручні параметри: `h`, smoothing, contour epsilon, max iterations factor, min quality).
+```bash
+python src/main.py --mode batch
+```
 
-## Структура проєкту
+In the editor, choose a preset (`Fast`, `Balanced`, `Accurate`) or `Custom` (target edge length `h`, smoothing iterations, contour tolerance, iteration factor, minimum triangle quality).
+
+## Coordinate file format
+
+```json
+{
+  "outer_boundary": [[100, 100], [500, 100], [500, 500], [100, 500], [100, 100]],
+  "inclusions": [
+    {
+      "vertices": [[220, 220], [380, 220], [380, 380], [220, 380], [220, 220]],
+      "type": "ignore"
+    }
+  ],
+  "cuts": [
+    [[130, 130], [190, 300]]
+  ]
+}
+```
+
+- `outer_boundary` is required: a list of `[x, y]` pairs.
+- `inclusions` is optional. Each inclusion has `vertices` and a `type`: `"ignore"` (hole) or `"merge"` (subdomain meshed together with the main region).
+- `cuts` is optional: a list of polylines, each with at least two points.
+- Coordinates can be integers or floats. Coordinates from JSON are used as given, without simplification.
+
+Examples are in `diagnostics/cases/` and `tests/fixtures/`.
+
+## Project structure
 
 ```text
 src/
-  application/
-    services/advancing_front_mesher.py
-    dto/complex_test_contours.py
-  domain/
-    entities/ (Point, Edge, Triangle, Polygon, Mesh)
-    geometry/geometry_utils.py
-    interfaces/imesh_generator.py
-  infrastructure/
-    image/photo_preprocessor.py
-    processing/image_boundary_extractor.py
-    export/mesh_exporter.py
-    visualization/debug_visualizer.py
-  presentation/
-    paint_app.py
-    triangulation_adapter.py
-    canvas.py, tools.py, main.py
-scripts/
-  generate_test_images.py
-  run_stress_benchmarks.py
-tests/
+  application/    mesher, region topology, boundary validation, postprocessing
+  domain/         points, triangles, mesh, node types, geometry utilities
+  infrastructure/ image preprocessing, coordinate import, export, visualization
+  presentation/   graphical editor and the triangulation adapter
+scripts/          test image generation, benchmarks
+diagnostics/      diagnostic scripts and example domains
+tests/            automated tests
 ```
 
-## Тести
+## Tests
 
-Покриті основні класи ризиків:
-- коректність доменних сутностей і геометричних утиліт;
-- інваріанти AFM (позитивні площі, відсутність самоперетинів, належність полігону);
-- стабільність на складних/випадкових/стресових кейсах;
-- якість сітки та порогові критерії;
-- інтеграційний pipeline “зображення -> boundary -> mesh -> debug output”;
-- експорт у формати;
-- preprocessing/contour extraction.
-
-Основні тестові модулі:
-- `test_contour_pipeline.py`
-- `test_boundary_validator.py`
-- `test_canvas_contour_integration.py`
-- `test_stroke_centerline_extractor.py`
-- `test_afm_invariants.py`
-- `test_afm_complex_quality.py`
-- `test_afm_mesh_integrity_extra.py`
-- `test_afm_randomized_regression.py`
-- `test_afm_stress_cases_extra.py`
-- `test_afm_subdivision_and_smoothing.py`
-- `test_image_quality_thresholds.py`
-- `test_main_pipeline.py`
-- та інші в каталозі `tests/`.
-
-Запуск:
 ```bash
 python -m unittest discover -s tests -p "test_*.py"
 ```
 
-## Скрипти
+The suite has 357 tests in 37 modules. Line coverage is 87.4% for the core (without the user interface modules) and 84.3% for the whole system.
 
-- `scripts/generate_test_images.py` — генерація синтетичних тестових зображень.
-- `scripts/run_stress_benchmarks.py` — серія запусків із різними `h` + метрики часу/пам’яті/якості.
+## License
 
-## Залежності
+MIT, see [LICENSE](LICENSE).
 
-`requirements.txt`:
-- `PySide6==6.10.0`
-- `Pillow==12.2.0`
-- `matplotlib==3.10.7`
+## Citation
 
-## Швидкий старт
-
-```bash
-pip install -r requirements.txt
-python src/main.py --mode ui
-```
-
-або для пакетного прогону:
-
-```bash
-python src/main.py --mode batch
-```
+If you use this software, please cite the paper above. The reference and the archived release DOI will be added here after publication.
