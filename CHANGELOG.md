@@ -1,5 +1,17 @@
-## [1.0.0] - 2026-10-24
+## [1.0.1] - 2026-10-26
+
 ### Added
+
+- MIT license
+
+### Updated
+
+- README
+
+## [1.0.0] - 2026-10-24
+
+### Added
+
 - Advancing front triangulation of planar domains with inclusions and zero-thickness cuts, using a two-sided representation of cuts in the front
 - Ear clipping fallback for the remaining front when no candidate is found
 - Domain input by drawing, from a raster image, or from a JSON coordinate file
